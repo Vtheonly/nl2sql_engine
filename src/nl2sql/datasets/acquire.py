@@ -88,11 +88,22 @@ def _locate_sqlite_root(search_dir: Path, expected_db_ids: set[str]) -> Path:
     candidates = [p for p in search_dir.rglob("*.sqlite") if "__MACOSX" not in str(p)]
     if not candidates:
         raise DatasetIntegrityError(f"No .sqlite database files found inside {search_dir}")
-    # Map db_id -> parent of <db_id>/<db_id>.sqlite
-    for p in candidates:
-        if p.stem in expected_db_ids and p.parent.name == p.stem:
-            return p.parent.parent
-    return candidates[0].parent.parent
+    # Preferred layout: <root>/<db_id>/<db_id>.sqlite for every expected db_id.
+    for db_id in expected_db_ids:
+        matches = [p for p in candidates if p.stem == db_id and p.parent.name == db_id]
+        if matches:
+            return matches[0].parent.parent
+    # Fallback: a root that resolves <root>/<db_id>/<db_id>.sqlite for ALL db_ids.
+    # Blindly using candidates[0].parent.parent silently mis-rooted archives whose
+    # databases sit at mixed nesting depths.
+    roots = {p.parent.parent for p in candidates}
+    for root in sorted(roots):
+        if all((root / db_id / f"{db_id}.sqlite").exists() for db_id in expected_db_ids):
+            return root
+    raise DatasetIntegrityError(
+        f"Could not locate a common database root holding {sorted(expected_db_ids)[:5]} "
+        f"under {search_dir}; expected layout <root>/<db_id>/<db_id>.sqlite."
+    )
 
 
 def _verify_db_coverage(records: list[dict], db_root: Path, dataset_name: str) -> None:

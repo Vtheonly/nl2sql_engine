@@ -23,6 +23,11 @@ FORBIDDEN_NODES = (
 )
 FORBIDDEN_FUNCTIONS = {"pg_sleep", "lo_export", "lo_import", "load_extension", "sqlite_load_extension"}
 
+# Aggregates whose value is invariant under row duplication caused by 1:N fan-out.
+# MIN/MAX ignore duplicates, and DISTINCT-inside-aggregate collapses them, so only
+# plain SUM/AVG/COUNT can silently multiply when two N:1 children are joined.
+_FANOUT_INVARIANT_FUNCS = {"MIN", "MAX"}
+
 
 class SQLSecurityError(ValueError):
     """Raised when generated SQL violates read-only AST or RBAC security policies."""
@@ -32,7 +37,7 @@ class CompiledSQL(BaseModel):
     sql: str
     used_tables: list[str] = Field(default_factory=list)
     join_repairs: list[str] = Field(default_factory=list)
-    fanout_cte_rewrites: list[str] = Field(default_factory=list)
+    fanout_warnings: list[str] = Field(default_factory=list)
     ambiguity_flags: list[str] = Field(default_factory=list)
 
 
@@ -68,27 +73,83 @@ def _is_trivial_on(on: Optional[exp.Expression]) -> bool:
     return on is None or (isinstance(on, exp.Boolean) and on.this is True)
 
 
+def _build_query_scope(ast: exp.Expression) -> dict[str, str]:
+    """Map every table (and its alias) referenced in the query to its canonical name.
+
+    Join-synthesis must emit ``o.customer_id`` when the query aliased orders as ``o``;
+    emitting the raw table name produces invalid SQL on aliased queries.
+    """
+    scope: dict[str, str] = {}
+    for tbl in ast.find_all(exp.Table):
+        tname = tbl.name
+        if not tname:
+            continue
+        alias_or_name = tbl.alias_or_name
+        scope.setdefault(tname.lower(), tname)
+        if alias_or_name:
+            scope.setdefault(alias_or_name.lower(), tname)
+    return scope
+
+
+def _agg_is_fanout_sensitive(agg: exp.AggFunc) -> bool:
+    name = (getattr(agg, "sql_name", lambda: "")() or "").upper()
+    if not name:
+        return False
+    if name in _FANOUT_INVARIANT_FUNCS:
+        return False
+    if agg.find(exp.Distinct) is not None:
+        # COUNT/SUM/AVG(DISTINCT x) collapses duplicated rows.
+        return False
+    return True
+
+
+def _is_inside_cte(node: exp.Expression) -> bool:
+    """True when the node sits inside a CTE (i.e. its result is pre-aggregated)."""
+    parent = getattr(node, "parent", None)
+    while parent is not None:
+        if isinstance(parent, exp.CTE):
+            return True
+        parent = getattr(parent, "parent", None)
+    return False
+
+
 def _detect_fanout_tables(ast: exp.Expression, bundle: SchemaBundle) -> list[str]:
-    """Identify multiple 1:N child tables aggregated simultaneously around a shared parent."""
-    aggs = list(ast.find_all(exp.AggFunc))
+    """Identify multiple 1:N child tables whose *fan-out-sensitive* aggregates are
+    computed simultaneously around a shared parent table.
+
+    Fan-out-invariant aggregates (MIN/MAX, DISTINCT variants), aggregates already
+    pre-aggregated inside CTEs, and children without a shared parent are excluded so
+    that safe queries are not flagged (which would force the engine to abstain).
+    """
+    aggs = [a for a in ast.find_all(exp.AggFunc) if _agg_is_fanout_sensitive(a) and not _is_inside_cte(a)]
     if len(aggs) < 2:
         return []
+
+    scope = _build_query_scope(ast)
     agg_tables: set[str] = set()
     for agg in aggs:
         for col in agg.find_all(exp.Column):
             if col.table:
-                agg_tables.add(col.table.lower())
+                agg_tables.add(scope.get(col.table.lower(), col.table.lower()))
     if len(agg_tables) < 2:
         return []
 
-    fanout_candidates: list[str] = []
+    # parents[t] = set of 1-side tables that t joins to through an N:1 edge.
+    parents: dict[str, set[str]] = {}
     for e in bundle.join_edges:
-        # N:1 means left_table is the 'N' (many) side pointing to right_table '1' side
-        if e.cardinality == "N:1" and e.left_table.lower() in agg_tables:
-            fanout_candidates.append(e.left_table)
-        elif e.cardinality == "1:N" and e.right_table.lower() in agg_tables:
-            fanout_candidates.append(e.right_table)
-    return sorted(set(fanout_candidates))
+        if e.cardinality == "N:1":
+            parents.setdefault(e.left_table.lower(), set()).add(e.right_table.lower())
+        elif e.cardinality == "1:N":
+            parents.setdefault(e.right_table.lower(), set()).add(e.left_table.lower())
+
+    candidates = [t for t in agg_tables if parents.get(t)]
+    if len(candidates) < 2:
+        return []
+    shared = set.intersection(*(parents[t] for t in candidates))
+    if not shared:
+        # Children aggregate against unrelated parents: no cross-fanout between them.
+        return []
+    return sorted(candidates)
 
 
 def compile_and_validate_sql(
@@ -137,39 +198,55 @@ def compile_and_validate_sql(
         from_expr = ast.args.get("from_") or ast.args.get("from")
         joins = ast.args.get("joins") or []
         if from_expr and joins:
-            base_tbl = from_expr.this.name if isinstance(from_expr.this, exp.Table) else None
-            seen_tbls = {base_tbl} if base_tbl else set()
+            scope = _build_query_scope(ast)
+            base_name = from_expr.this.name if isinstance(from_expr.this, exp.Table) else None
+            base_tbl = scope.get(base_name.lower()) if base_name else None
+            # table name (lower) -> reference spelling (alias or name) to use in ON clauses
+            seen_refs: dict[str, str] = {}
+            seen_tbls: set[str] = set()
+            if base_tbl:
+                base_ref = from_expr.this.alias_or_name if isinstance(from_expr.this, exp.Table) else base_tbl
+                seen_refs[base_tbl.lower()] = base_ref or base_tbl
+                seen_tbls.add(base_tbl)
             for j in joins:
                 j_tbl = j.this.name if isinstance(j.this, exp.Table) else None
                 if not j_tbl:
                     continue
+                j_canon = scope.get(j_tbl.lower(), j_tbl)
+                j_ref = j.this.alias_or_name if isinstance(j.this, exp.Table) else j_canon
                 if _is_trivial_on(j.args.get("on")) and j.args.get("using") is None and seen_tbls:
                     # Try single-hop or shortest path from any already-joined table
                     chosen_path: Optional[list[JoinEdge]] = None
                     for prev in sorted(seen_tbls):
-                        paths = _find_join_path(bundle.join_edges, prev, j_tbl)
+                        paths = _find_join_path(bundle.join_edges, prev, j_canon)
                         if len(paths) > 1:
-                            ambiguity_flags.append(f"Multiple join paths between {prev} and {j_tbl}")
+                            ambiguity_flags.append(f"Multiple join paths between {prev} and {j_canon}")
                         if paths:
                             chosen_path = max(paths, key=lambda p: sum(e.confidence for e in p))
                             break
                     if chosen_path and len(chosen_path) == 1:
                         e = chosen_path[0]
+                        # Resolve each endpoint to the alias actually used in this query:
+                        # the new table uses the join's own alias, the other side uses
+                        # an alias already visible in the FROM scope.
+                        left_ref = j_ref if e.left_table.lower() == j_canon.lower() else seen_refs.get(e.left_table.lower(), e.left_table)
+                        right_ref = j_ref if e.right_table.lower() == j_canon.lower() else seen_refs.get(e.right_table.lower(), e.right_table)
                         on_cond = exp.EQ(
-                            this=exp.Column(this=exp.to_identifier(e.left_column), table=exp.to_identifier(e.left_table)),
-                            expression=exp.Column(this=exp.to_identifier(e.right_column), table=exp.to_identifier(e.right_table)),
+                            this=exp.Column(this=exp.to_identifier(e.left_column), table=exp.to_identifier(left_ref)),
+                            expression=exp.Column(this=exp.to_identifier(e.right_column), table=exp.to_identifier(right_ref)),
                         )
                         j.set("on", on_cond)
                         join_repairs.append(f"Synthesized ON {e.left_table}.{e.left_column} = {e.right_table}.{e.right_column}")
                     else:
-                        ambiguity_flags.append(f"Unconstrained join on table {j_tbl}")
-                seen_tbls.add(j_tbl)
+                        ambiguity_flags.append(f"Unconstrained join on table {j_canon}")
+                seen_refs.setdefault(j_canon.lower(), j_ref or j_canon)
+                seen_tbls.add(j_canon)
 
     # Detect diverging 1:N multi-fact fan-out traps
     fanout_tables = _detect_fanout_tables(ast, bundle)
-    fanout_rewrites: list[str] = []
+    fanout_warnings: list[str] = []
     if len(fanout_tables) >= 2:
-        fanout_rewrites.append(
+        fanout_warnings.append(
             f"Fan-out risk detected across multiple 1:N tables ({', '.join(fanout_tables)}); review CTE pre-aggregation"
         )
         ambiguity_flags.append(f"Potential M:N fan-out aggregation across {', '.join(fanout_tables)}")
@@ -185,6 +262,6 @@ def compile_and_validate_sql(
         sql=final_sql,
         used_tables=referenced_tables,
         join_repairs=join_repairs,
-        fanout_cte_rewrites=fanout_rewrites,
+        fanout_warnings=fanout_warnings,
         ambiguity_flags=ambiguity_flags,
     )

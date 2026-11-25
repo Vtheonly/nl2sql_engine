@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -107,7 +108,15 @@ def _normalize_stem(name: str) -> str:
     return stem[:-1] if stem.endswith("s") and len(stem) > 3 else stem
 
 
-def _probe_inclusion(engine: Engine, lt: str, lc: str, rt: str, rc: str, sample_limit: int = 300) -> float:
+def _probe_inclusion(
+    engine: Engine,
+    lt: str,
+    lc: str,
+    rt: str,
+    rc: str,
+    sample_limit: int = 300,
+    timeout_sec: float = 5.0,
+) -> float:
     ql, qlc = _quote_ident(engine, lt), _quote_ident(engine, lc)
     qr, qrc = _quote_ident(engine, rt), _quote_ident(engine, rc)
     sql = text(
@@ -117,12 +126,62 @@ def _probe_inclusion(engine: Engine, lt: str, lc: str, rt: str, rc: str, sample_
     )
     try:
         with engine.connect() as conn:
-            row = conn.execute(sql, {"lim": sample_limit}).fetchone()
+            # Bound the un-indexed IN (SELECT ...) probe: on a 10M-row table a cold-start
+            # introspection used to stall for minutes. SQLite progress handlers abort the
+            # statement once the deadline passes; non-SQLite drivers fall back to running on.
+            raw = getattr(conn, "connection", None)
+            handler_set = False
+            if raw is not None and hasattr(raw, "set_progress_handler"):
+                deadline = time.perf_counter() + timeout_sec
+                raw.set_progress_handler(lambda: 1 if time.perf_counter() > deadline else 0, 10000)
+                handler_set = True
+            try:
+                row = conn.execute(sql, {"lim": sample_limit}).fetchone()
+            finally:
+                if handler_set:
+                    raw.set_progress_handler(None, 0)
             if not row or not row[0] or row[0] == 0:
                 return 0.0
             return float(row[1] or 0) / float(row[0])
     except Exception:
         return 0.0
+
+
+def _ddl_hash_from_tables(tables: list[TableInfo]) -> str:
+    """Stable hash of table/column/type/PK structure (the schema cache version key)."""
+    ddl_repr = json.dumps(
+        [{"t": t.name, "c": [(c.name, c.data_type, c.is_pk) for c in t.columns]} for t in tables],
+        sort_keys=True,
+    )
+    return hashlib.sha256(ddl_repr.encode("utf-8")).hexdigest()[:16]
+
+
+def compute_ddl_hash(connection_url: str) -> str:
+    """Compute the live schema hash of a database without full introspection.
+
+    Used to detect schema drift: cached SchemaBundles whose ``ddl_hash`` no longer
+    matches the live database are rebuilt instead of being served stale forever.
+    """
+    engine = create_engine(connection_url)
+    try:
+        insp = inspect(engine)
+        tables: list[TableInfo] = []
+        for table_name in sorted(insp.get_table_names()):
+            if table_name.startswith("sqlite_"):
+                continue
+            pk_cols = set((insp.get_pk_constraint(table_name) or {}).get("constrained_columns") or [])
+            columns = [
+                ColumnInfo(
+                    name=col["name"],
+                    data_type=str(col["type"]),
+                    is_pk=(col["name"] in pk_cols and len(pk_cols) == 1),
+                )
+                for col in insp.get_columns(table_name)
+            ]
+            tables.append(TableInfo(name=table_name, columns=columns))
+        return _ddl_hash_from_tables(tables)
+    finally:
+        engine.dispose()
 
 
 def introspect_database(
@@ -242,11 +301,18 @@ def introspect_database(
         pk_targets: list[tuple[TableInfo, ColumnInfo]] = [
             (t, c) for t in tables for c in t.columns if c.is_pk or c.is_unique
         ]
+        # Suffixes shared by non-``_id`` foreign keys in real corpora (cds_code,
+        # driverRef, symbol, zip...). Same-name pairs are always considered.
+        fk_suffixes = ("id", "_code", "code", "_ref", "ref", "key", "symbol", "name", "no")
         for t_l in tables:
             if t_l.row_count == 0:
                 continue
             for c_l in t_l.columns:
-                if not (c_l.name.lower().endswith("id") or c_l.is_pk):
+                lname = c_l.name.lower()
+                if not (
+                    lname.endswith(fk_suffixes)
+                    or c_l.is_pk
+                ):
                     continue
                 l_stem = _normalize_stem(c_l.name)
                 for t_r, c_r in pk_targets:
@@ -279,10 +345,6 @@ def introspect_database(
                             )
                         )
 
-    ddl_repr = json.dumps(
-        [{"t": t.name, "c": [(c.name, c.data_type, c.is_pk) for c in t.columns]} for t in tables],
-        sort_keys=True,
-    )
-    ddl_hash = hashlib.sha256(ddl_repr.encode("utf-8")).hexdigest()[:16]
+    ddl_hash = _ddl_hash_from_tables(tables)
     engine.dispose()
     return SchemaBundle(db_id=db_id, dialect=dialect, ddl_hash=ddl_hash, tables=tables, join_edges=edges)

@@ -33,6 +33,7 @@ class CheckpointManager:
         config_dict: dict[str, Any],
         metrics_history: list[dict[str, Any]],
         is_best: bool = False,
+        patience_left: Optional[int] = None,
     ) -> Path:
         step_dir = self.ckpt_root / stage / f"step_{global_step:07d}"
         tmp_dir = self.ckpt_root / stage / f".tmp_step_{global_step:07d}"
@@ -45,6 +46,7 @@ class CheckpointManager:
             "epoch": epoch,
             "global_step": global_step,
             "best_metric": best_metric,
+            "patience_left": patience_left,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
@@ -55,7 +57,13 @@ class CheckpointManager:
         }
         torch.save(payload, tmp_dir / "trainer_state.pt")
         (tmp_dir / "meta.json").write_text(
-            json.dumps({"stage": stage, "epoch": epoch, "global_step": global_step, "best_metric": best_metric}, indent=2),
+            json.dumps(
+                {
+                    "stage": stage, "epoch": epoch, "global_step": global_step,
+                    "best_metric": best_metric, "patience_left": patience_left,
+                },
+                indent=2,
+            ),
             encoding="utf-8",
         )
 

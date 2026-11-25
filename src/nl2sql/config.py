@@ -57,6 +57,9 @@ class TrainingConfig(BaseModel):
     early_stopping_patience: int = Field(default=3, ge=1)
     resume_from: Optional[str] = "auto"
     num_workers: int = 2
+    # Cut activation memory for long-context encoders (ModernBERT at 4096 tokens on
+    # free-tier GPUs) at the cost of a recompute pass.
+    gradient_checkpointing: bool = False
 
 
 class HubConfig(BaseModel):

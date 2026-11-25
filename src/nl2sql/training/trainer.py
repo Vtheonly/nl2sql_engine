@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import math
 import random
 from pathlib import Path
@@ -11,6 +10,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import AutoModel, AutoTokenizer, get_cosine_schedule_with_warmup
 
+from nl2sql.compiler.sql_compiler import SQLSecurityError, compile_and_validate_sql
 from nl2sql.config import EngineConfig
 from nl2sql.datasets.prepare import (
     EmbedderDataset,
@@ -26,11 +26,102 @@ from nl2sql.evaluation.evaluator import execute_sqlite_readonly, results_equival
 from nl2sql.models.graphix_parser import GraphixCodeT5Parser
 from nl2sql.models.schema_linker import ModernBertSchemaLinker
 from nl2sql.models.verifier import ModernBertVerifier
+from nl2sql.retrieval.schema_retriever import DenseTableEncoder, HybridSchemaRetriever
 from nl2sql.training.checkpoint import CheckpointManager
 from nl2sql.utils.logging import get_logger, get_resource_stats
 from nl2sql.utils.repro import set_seed
 
 logger = get_logger(__name__)
+
+
+class _EmbedderCollate:
+    """MNRL bi-encoder pair collate (module-level so DataLoader workers can pickle it)."""
+
+    def __init__(self, tokenizer: Any) -> None:
+        self.tokenizer = tokenizer
+
+    def __call__(self, batch: list[dict[str, str]]) -> dict[str, Any]:
+        q_enc = self.tokenizer([b["query"] for b in batch], padding=True, truncation=True, max_length=128, return_tensors="pt")
+        p_enc = self.tokenizer([b["positive"] for b in batch], padding=True, truncation=True, max_length=128, return_tensors="pt")
+        return {"q": q_enc, "p": p_enc}
+
+
+class _LinkerCollate:
+    """Holds only the tokenizer: DataLoader workers pickle the collate, so shipping
+    model weights inside it would duplicate the network in every worker."""
+
+    def __init__(self, tokenizer: Any, max_length: int) -> None:
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
+        texts, t_lbls, c_lbls = [], [], []
+        for item in batch:
+            txt, _, _ = ModernBertSchemaLinker.format_inputs(
+                item["question"], item["bundle"].tables, item["value_matches"], item["evidence"]
+            )
+            texts.append(txt)
+            t_lbls.append(torch.tensor([t["label"] for t in item["table_items"]], dtype=torch.float32))
+            c_lbls.append(torch.tensor([c["label"] for c in item["col_items"]], dtype=torch.float32))
+        enc = self.tokenizer(texts, padding=True, truncation=True, max_length=self.max_length, return_tensors="pt")
+        return {"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"], "table_labels": t_lbls, "column_labels": c_lbls}
+
+
+class _ParserCollate:
+    def __init__(self, tokenizer: Any, max_source_length: int, max_target_length: int) -> None:
+        self.tokenizer = tokenizer
+        self.max_source_length = max_source_length
+        self.max_target_length = max_target_length
+        self.pad_token_id = getattr(tokenizer, "pad_token_id", 0)
+
+    def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
+        src_enc = self.tokenizer(
+            [b["source_text"] for b in batch], padding=True, truncation=True,
+            max_length=self.max_source_length, return_tensors="pt",
+        )
+        tgt_enc = self.tokenizer(
+            text_target=[b["target_sql"] for b in batch], padding=True, truncation=True,
+            max_length=self.max_target_length, return_tensors="pt",
+        )
+        labels = tgt_enc["input_ids"].clone()
+        labels[labels == self.pad_token_id] = -100
+        rel = GraphixCodeT5Parser.build_relation_matrix(
+            src_enc["input_ids"], self.tokenizer,
+            [b["bundle"] for b in batch], [b["selected_tables"] for b in batch], [b["value_matches"] for b in batch],
+        )
+        return {"input_ids": src_enc["input_ids"], "attention_mask": src_enc["attention_mask"], "labels": labels, "rel_matrix": rel}
+
+
+class _VerifierCollate:
+    def __init__(self, tokenizer: Any, max_length: int) -> None:
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __call__(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
+        texts = [ModernBertVerifier.format_pair(b["question"], b["schema_text"], b["candidate_sql"], b["exec_status"]) for b in batch]
+        enc = self.tokenizer(texts, padding=True, truncation=True, max_length=self.max_length, return_tensors="pt")
+        labels = torch.tensor([b["label"] for b in batch], dtype=torch.float32)
+        return {"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"], "labels": labels}
+
+
+def _maybe_enable_gradient_checkpointing(model: nn.Module) -> None:
+    """Cut activation memory for long-context encoders (ModernBERT at 4096 tokens)."""
+    encoder = getattr(model, "encoder", None)
+    # transformers renamed the API (gradient_checkpointing_enable -> activation_checkpointing_enable);
+    # try both so the flag keeps working across versions.
+    for attr in ("activation_checkpointing_enable", "gradient_checkpointing_enable"):
+        enable = getattr(encoder, attr, None)
+        if enable is None:
+            continue
+        try:
+            try:
+                enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            except TypeError:
+                enable()
+            return
+        except Exception as exc:
+            logger.warning("Gradient checkpointing unavailable for %s (%s).", type(model).__name__, exc)
+            return
 
 
 class NL2SQLTrainer:
@@ -50,6 +141,15 @@ class NL2SQLTrainer:
             return torch.bfloat16
         return torch.float16
 
+    def _loader(self, dataset: Any, collate: Any, batch_size: int, shuffle: bool) -> DataLoader:
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            collate_fn=collate,
+            num_workers=self.cfg.training.num_workers,
+        )
+
     def _run_generic_loop(
         self,
         stage: str,
@@ -62,7 +162,9 @@ class NL2SQLTrainer:
         model = model.to(self.device)
         tcfg = self.cfg.training
         optimizer = torch.optim.AdamW(model.parameters(), lr=tcfg.learning_rate, weight_decay=tcfg.weight_decay)
-        total_steps = max(1, (len(train_loader) * tcfg.epochs) // tcfg.grad_accum_steps)
+        # Exact step count: floor division undercounted whenever the last partial
+        # accumulation window remained, decaying the LR schedule to zero early.
+        total_steps = max(1, math.ceil(len(train_loader) / tcfg.grad_accum_steps) * tcfg.epochs)
         scheduler = get_cosine_schedule_with_warmup(
             optimizer, num_warmup_steps=int(total_steps * tcfg.warmup_ratio), num_training_steps=total_steps
         )
@@ -80,9 +182,13 @@ class NL2SQLTrainer:
             payload = self.ckpt_mgr.load(
                 resume_dir, model=model, optimizer=optimizer, scheduler=scheduler, scaler=scaler, map_location=str(self.device)
             )
+            # Checkpoints always record the NEXT epoch to run (epoch-boundary resume),
+            # so an interrupted run never re-processes already-trained batches while
+            # global_step (and the LR schedule) races ahead.
             start_epoch = int(payload["epoch"])
             global_step = int(payload["global_step"])
             best_val_loss = float(payload["best_metric"])
+            patience_left = int(payload.get("patience_left", tcfg.early_stopping_patience))
             history = list(payload.get("metrics_history", []))
             logger.info("Resumed stage='%s' from %s (epoch=%d, step=%d)", stage, resume_dir, start_epoch, global_step)
 
@@ -111,11 +217,13 @@ class NL2SQLTrainer:
                     global_step += 1
 
                     if global_step % tcfg.save_every_steps == 0:
+                        # Mid-epoch saves record epoch + 1: resuming continues at the
+                        # next epoch boundary instead of replaying this epoch's batches.
                         self.ckpt_mgr.save(
                             stage=stage, model=model, optimizer=optimizer, scheduler=scheduler,
-                            scaler=scaler, epoch=epoch, global_step=global_step,
+                            scaler=scaler, epoch=epoch + 1, global_step=global_step,
                             best_metric=best_val_loss, config_dict=self.cfg.model_dump(mode="json"),
-                            metrics_history=history, is_best=False,
+                            metrics_history=history, is_best=False, patience_left=patience_left,
                         )
 
             train_loss = running_loss / max(n_batches, 1)
@@ -155,7 +263,7 @@ class NL2SQLTrainer:
                 stage=stage, model=model, optimizer=optimizer, scheduler=scheduler,
                 scaler=scaler, epoch=epoch + 1, global_step=global_step,
                 best_metric=best_val_loss, config_dict=self.cfg.model_dump(mode="json"),
-                metrics_history=history, is_best=is_best,
+                metrics_history=history, is_best=is_best, patience_left=patience_left,
             )
             if patience_left <= 0:
                 logger.info("[%s] Early stopping triggered at epoch %d", stage, epoch + 1)
@@ -171,10 +279,7 @@ class NL2SQLTrainer:
         train_ds = EmbedderDataset(train_records, caches)
         val_ds = EmbedderDataset(val_records, caches) if val_records else None
 
-        def collate(batch):
-            q_enc = tokenizer([b["query"] for b in batch], padding=True, truncation=True, max_length=128, return_tensors="pt")
-            p_enc = tokenizer([b["positive"] for b in batch], padding=True, truncation=True, max_length=128, return_tensors="pt")
-            return {"q": q_enc, "p": p_enc}
+        collate = _EmbedderCollate(tokenizer)
 
         def step(m, batch, dev):
             q_out = nn.functional.normalize(m(**{k: v.to(dev) for k, v in batch["q"].items()}).last_hidden_state[:, 0], dim=-1)
@@ -188,30 +293,24 @@ class NL2SQLTrainer:
             tokenizer.save_pretrained(out_dir)
             m.save_pretrained(out_dir)
 
-        t_loader = DataLoader(train_ds, batch_size=max(16, self.cfg.training.batch_size * 2), shuffle=True, collate_fn=collate)
-        v_loader = DataLoader(val_ds, batch_size=32, shuffle=False, collate_fn=collate) if val_ds and len(val_ds) > 0 else None
+        t_loader = self._loader(train_ds, collate, batch_size=max(16, self.cfg.training.batch_size * 2), shuffle=True)
+        v_loader = self._loader(val_ds, collate, batch_size=32, shuffle=False) if val_ds and len(val_ds) > 0 else None
         return self._run_generic_loop("embedder", encoder, t_loader, v_loader, step, save_fn)
 
     def train_linker(self, train_records: list[ExampleRecord], val_records: list[ExampleRecord], caches: dict[str, tuple[SchemaBundle, ValueIndex]]) -> dict[str, Any]:
         model = ModernBertSchemaLinker(self.cfg.models.linker_model_id, pos_weight=self.cfg.models.linker_recall_pos_weight)
+        if self.cfg.training.gradient_checkpointing:
+            _maybe_enable_gradient_checkpointing(model)
         train_ds = LinkerDataset(train_records, caches, perturb_prob=self.cfg.data.schema_perturbation_prob, seed=self.cfg.seed)
         val_ds = LinkerDataset(val_records, caches, perturb_prob=0.0, seed=self.cfg.seed) if val_records else None
 
-        def collate(batch):
-            texts, t_lbls, c_lbls = [], [], []
-            for item in batch:
-                txt, _, _ = model.format_inputs(item["question"], item["bundle"].tables, item["value_matches"], item["evidence"])
-                texts.append(txt)
-                t_lbls.append(torch.tensor([t["label"] for t in item["table_items"]], dtype=torch.float32))
-                c_lbls.append(torch.tensor([c["label"] for c in item["col_items"]], dtype=torch.float32))
-            enc = model.tokenizer(texts, padding=True, truncation=True, max_length=self.cfg.models.linker_max_length, return_tensors="pt")
-            return {"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"], "table_labels": t_lbls, "column_labels": c_lbls}
+        collate = _LinkerCollate(model.tokenizer, self.cfg.models.linker_max_length)
 
         def step(m, batch, dev):
             return m(batch["input_ids"].to(dev), batch["attention_mask"].to(dev), batch["table_labels"], batch["column_labels"])["loss"]
 
-        t_loader = DataLoader(train_ds, batch_size=max(2, self.cfg.training.batch_size // 2), shuffle=True, collate_fn=collate)
-        v_loader = DataLoader(val_ds, batch_size=max(2, self.cfg.training.batch_size // 2), shuffle=False, collate_fn=collate) if val_ds and len(val_ds) > 0 else None
+        t_loader = self._loader(train_ds, collate, batch_size=max(2, self.cfg.training.batch_size // 2), shuffle=True)
+        v_loader = self._loader(val_ds, collate, batch_size=max(2, self.cfg.training.batch_size // 2), shuffle=False) if val_ds and len(val_ds) > 0 else None
         return self._run_generic_loop("linker", model, t_loader, v_loader, step, lambda m, d: m.save_pretrained(d))
 
     def train_parser(self, train_records: list[ExampleRecord], val_records: list[ExampleRecord], caches: dict[str, tuple[SchemaBundle, ValueIndex]]) -> dict[str, Any]:
@@ -219,23 +318,39 @@ class NL2SQLTrainer:
         train_ds = ParserDataset(train_records, caches, perturb_prob=self.cfg.data.schema_perturbation_prob, seed=self.cfg.seed)
         val_ds = ParserDataset(val_records, caches, perturb_prob=0.0, seed=self.cfg.seed) if val_records else None
 
-        def collate(batch):
-            src_enc = model.tokenizer([b["source_text"] for b in batch], padding=True, truncation=True, max_length=self.cfg.models.parser_max_source_length, return_tensors="pt")
-            tgt_enc = model.tokenizer(text_target=[b["target_sql"] for b in batch], padding=True, truncation=True, max_length=self.cfg.models.parser_max_target_length, return_tensors="pt")
-            labels = tgt_enc["input_ids"].clone()
-            labels[labels == model.tokenizer.pad_token_id] = -100
-            rel = GraphixCodeT5Parser.build_relation_matrix(
-                src_enc["input_ids"], model.tokenizer,
-                [b["bundle"] for b in batch], [b["selected_tables"] for b in batch], [b["value_matches"] for b in batch],
-            )
-            return {"input_ids": src_enc["input_ids"], "attention_mask": src_enc["attention_mask"], "labels": labels, "rel_matrix": rel}
+        collate = _ParserCollate(model.tokenizer, self.cfg.models.parser_max_source_length, self.cfg.models.parser_max_target_length)
 
         def step(m, batch, dev):
             return m(batch["input_ids"].to(dev), batch["attention_mask"].to(dev), batch["labels"].to(dev), batch["rel_matrix"].to(dev)).loss
 
-        t_loader = DataLoader(train_ds, batch_size=self.cfg.training.batch_size, shuffle=True, collate_fn=collate)
-        v_loader = DataLoader(val_ds, batch_size=self.cfg.training.batch_size, shuffle=False, collate_fn=collate) if val_ds and len(val_ds) > 0 else None
+        t_loader = self._loader(train_ds, collate, batch_size=self.cfg.training.batch_size, shuffle=True)
+        v_loader = self._loader(val_ds, collate, batch_size=self.cfg.training.batch_size, shuffle=False) if val_ds and len(val_ds) > 0 else None
         return self._run_generic_loop("parser", model, t_loader, v_loader, step, lambda m, d: m.save_pretrained(d))
+
+    def _serve_time_tables(
+        self,
+        rec: ExampleRecord,
+        bundle: SchemaBundle,
+        v_idx: ValueIndex,
+        retriever: HybridSchemaRetriever,
+        linker: Optional[ModernBertSchemaLinker],
+    ) -> list[Any]:
+        """Select tables the way the serving engine does: retrieval + linker pruning.
+
+        Mining with oracle gold tables made the verifier learn under a table
+        distribution it never sees at inference time.
+        """
+        ret = retriever.retrieve(rec.question, bundle, v_idx)
+        cand_tables = ret.candidate_tables
+        if linker is not None:
+            return linker.prune_schema(
+                rec.question, bundle, cand_tables, ret.value_matches, evidence=rec.evidence,
+                threshold=self.cfg.models.linker_threshold,
+                min_tables=self.cfg.models.linker_min_tables,
+                max_tables=self.cfg.models.linker_max_tables,
+                max_length=self.cfg.models.linker_max_length,
+            )
+        return cand_tables[: self.cfg.models.linker_max_tables]
 
     def mine_verifier_samples(
         self,
@@ -246,40 +361,111 @@ class NL2SQLTrainer:
     ) -> list[dict[str, Any]]:
         """Run trained parser over train DBs to collect execution-divergence hard negatives."""
         parser = GraphixCodeT5Parser.from_pretrained_dir(parser_dir, map_location=str(self.device)).to(self.device)
+
+        art_dir = Path(self.cfg.training.output_dir) / "artifacts"
+        # Same retrieval stack as the serving engine, so mined samples match the
+        # inference-time table distribution (and SQLGlot-canonical SQL formatting).
+        try:
+            embedder = DenseTableEncoder(self.cfg.models.embedder_model_id, device=str(self.device))
+            retriever = HybridSchemaRetriever(embedder)
+        except Exception as exc:
+            logger.warning("Could not load embedder for verifier mining (%s); using tables[:8].", exc)
+            retriever = None
+        linker: Optional[ModernBertSchemaLinker] = None
+        if (art_dir / "linker" / "linker_weights.pt").exists():
+            try:
+                linker = ModernBertSchemaLinker.from_pretrained_dir(art_dir / "linker", map_location=str(self.device)).to(self.device)
+            except Exception as exc:
+                logger.warning("Could not load linker artifact for verifier mining (%s).", exc)
+
         rng = random.Random(self.cfg.seed)
         subset = records[:] if len(records) <= max_records else rng.sample(records, max_records)
         samples: list[dict[str, Any]] = []
 
         for rec in subset:
             bundle, v_idx = caches[rec.db_id]
-            vals = v_idx.probe(rec.question, top_k=5)
-            gold_set = {t.lower() for t in rec.gold_tables}
-            tables = [t for t in bundle.tables if t.name.lower() in gold_set][:6] or bundle.tables[:4]
-            schema_txt = format_schema_for_parser(bundle, tables, vals, rec.question, rec.evidence)
+            if retriever is not None:
+                tables = self._serve_time_tables(rec, bundle, v_idx, retriever, linker)
+            else:
+                tables = bundle.tables[: self.cfg.models.linker_max_tables]
+            tables = tables or bundle.tables[:4]
+            val_hits = rec.value_matches or v_idx.probe(rec.question, top_k=5)
+            schema_txt = format_schema_for_parser(bundle, tables, val_hits, rec.question, rec.evidence)
 
-            g_ok, g_rows, _, g_msg = execute_sqlite_readonly(rec.db_path, rec.sql)
+            # Both gold and predicted candidates pass through the same compiler the
+            # engine uses, so the verifier cannot win by spotting raw-vs-compiled
+            # formatting differences instead of semantic errors.
+            try:
+                gold_sql = compile_and_validate_sql(rec.sql, bundle, default_limit=0).sql
+            except SQLSecurityError:
+                gold_sql = rec.sql.strip()
+
+            g_ok, g_rows, _, g_msg = execute_sqlite_readonly(rec.db_path, gold_sql)
             if g_ok and g_rows is not None:
                 samples.append({
-                    "question": rec.question, "schema_text": schema_txt, "candidate_sql": rec.sql,
+                    "question": rec.question, "schema_text": schema_txt, "candidate_sql": gold_sql,
                     "exec_status": f"ok rows={len(g_rows)}", "label": 1.0,
                 })
 
             cands = parser.generate_candidates(
-                schema_txt, bundle, tables, vals, num_candidates=3,
+                schema_txt, bundle, tables, val_hits, num_candidates=3,
                 max_source_len=self.cfg.models.parser_max_source_length,
                 max_target_len=self.cfg.models.parser_max_target_length,
                 use_xgrammar=self.cfg.models.use_xgrammar,
             )
             for c_sql in cands:
-                p_ok, p_rows, _, p_msg = execute_sqlite_readonly(rec.db_path, c_sql)
+                try:
+                    cand_sql = compile_and_validate_sql(c_sql, bundle, default_limit=0).sql
+                except SQLSecurityError:
+                    cand_sql = c_sql.strip()
+                p_ok, p_rows, _, p_msg = execute_sqlite_readonly(rec.db_path, cand_sql)
                 is_right = bool(g_ok and p_ok and g_rows is not None and p_rows is not None and results_equivalent(rec.sql, g_rows, p_rows))
                 if not is_right:
                     samples.append({
-                        "question": rec.question, "schema_text": schema_txt, "candidate_sql": c_sql,
+                        "question": rec.question, "schema_text": schema_txt, "candidate_sql": cand_sql,
                         "exec_status": f"ok rows={len(p_rows)}" if p_ok and p_rows is not None else f"err={p_msg[:60]}",
                         "label": 0.0,
                     })
         return samples
+
+    @torch.no_grad()
+    def _calibrate_temperature(self, model: ModernBertVerifier, val_samples: list[dict[str, Any]], max_length: int) -> None:
+        """Fit the verifier temperature on validation logits (1-pass LBFGS).
+
+        Without calibration the abstention threshold operates on raw sigmoid scores,
+        making its 0.45 cut-off arbitrary.
+        """
+        if len(val_samples) < 8 or len({s["label"] for s in val_samples}) < 2:
+            return
+        model.eval()
+        collate = _VerifierCollate(model.tokenizer, self.cfg.models.verifier_max_length)
+        loader = DataLoader(VerifierDataset(val_samples), batch_size=16, shuffle=False, collate_fn=collate)
+        logits_all: list[torch.Tensor] = []
+        labels_all: list[torch.Tensor] = []
+        for batch in loader:
+            out = model(batch["input_ids"].to(self.device), batch["attention_mask"].to(self.device))
+            logits_all.append(out["logits"].float().cpu())
+            labels_all.append(batch["labels"].cpu())
+        logits = torch.cat(logits_all)
+        labels = torch.cat(labels_all)
+
+        temp = torch.nn.Parameter(torch.tensor(1.0))
+        optimizer = torch.optim.LBFGS([temp], lr=0.1, max_iter=50, line_search_fn="strong_wolfe")
+
+        def closure() -> torch.Tensor:
+            optimizer.zero_grad()
+            loss = nn.functional.binary_cross_entropy_with_logits(logits / temp.clamp(min=0.05), labels)
+            loss.backward()
+            return loss
+
+        try:
+            optimizer.step(closure)
+        except Exception as exc:
+            logger.warning("Temperature calibration failed (%s); keeping T=1.0.", exc)
+            return
+        fitted = float(temp.detach().clamp(min=0.05, max=10.0).item())
+        model.temperature.fill_(fitted)
+        logger.info("Verifier temperature calibrated to %.4f.", fitted)
 
     def train_verifier(self, train_records: list[ExampleRecord], val_records: list[ExampleRecord], caches: dict[str, tuple[SchemaBundle, ValueIndex]]) -> dict[str, Any]:
         parser_art = Path(self.cfg.training.output_dir) / "artifacts" / "parser"
@@ -288,16 +474,19 @@ class NL2SQLTrainer:
         t_samples = self.mine_verifier_samples(train_records, caches, parser_art, max_records=1500)
         v_samples = self.mine_verifier_samples(val_records, caches, parser_art, max_records=300) if val_records else []
         model = ModernBertVerifier(self.cfg.models.verifier_model_id)
+        if self.cfg.training.gradient_checkpointing:
+            _maybe_enable_gradient_checkpointing(model)
 
-        def collate(batch):
-            texts = [model.format_pair(b["question"], b["schema_text"], b["candidate_sql"], b["exec_status"]) for b in batch]
-            enc = model.tokenizer(texts, padding=True, truncation=True, max_length=self.cfg.models.verifier_max_length, return_tensors="pt")
-            labels = torch.tensor([b["label"] for b in batch], dtype=torch.float32)
-            return {"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"], "labels": labels}
+        collate = _VerifierCollate(model.tokenizer, self.cfg.models.verifier_max_length)
 
         def step(m, batch, dev):
             return m(batch["input_ids"].to(dev), batch["attention_mask"].to(dev), batch["labels"].to(dev))["loss"]
 
-        t_loader = DataLoader(VerifierDataset(t_samples), batch_size=self.cfg.training.batch_size, shuffle=True, collate_fn=collate)
-        v_loader = DataLoader(VerifierDataset(v_samples), batch_size=self.cfg.training.batch_size, shuffle=False, collate_fn=collate) if v_samples else None
-        return self._run_generic_loop("verifier", model, t_loader, v_loader, step, lambda m, d: m.save_pretrained(d))
+        t_loader = self._loader(VerifierDataset(t_samples), collate, batch_size=self.cfg.training.batch_size, shuffle=True)
+        v_loader = self._loader(VerifierDataset(v_samples), collate, batch_size=self.cfg.training.batch_size, shuffle=False) if v_samples else None
+        result = self._run_generic_loop("verifier", model, t_loader, v_loader, step, lambda m, d: m.save_pretrained(d))
+
+        # Post-training calibration on validation logits, persisted into the artifact.
+        self._calibrate_temperature(model, v_samples, self.cfg.models.verifier_max_length)
+        model.save_pretrained(Path(self.cfg.training.output_dir) / "artifacts" / "verifier")
+        return result

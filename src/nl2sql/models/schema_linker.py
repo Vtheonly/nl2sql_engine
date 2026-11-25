@@ -42,8 +42,8 @@ class ModernBertSchemaLinker(nn.Module):
         self.column_head = nn.Sequential(nn.Dropout(0.1), nn.Linear(hidden, 1))
         self.register_buffer("pos_weight", torch.tensor([pos_weight], dtype=torch.float32))
 
+    @staticmethod
     def format_inputs(
-        self,
         question: str,
         tables: list[TableInfo],
         value_matches: list[ValueMatch],
@@ -61,8 +61,8 @@ class ModernBertSchemaLinker(nn.Module):
             for c in t.columns:
                 col_names.append(f"{t.name}.{c.name}")
                 samp = f" ({', '.join(c.sample_values[:2])})" if c.sample_values else ""
-                c_parts.append(f"{self.COL_TOKEN} {c.name}:{c.data_type}{samp}")
-            chunks.append(f"{self.TBL_TOKEN} {t.name}: " + " ".join(c_parts))
+                c_parts.append(f"{ModernBertSchemaLinker.COL_TOKEN} {c.name}:{c.data_type}{samp}")
+            chunks.append(f"{ModernBertSchemaLinker.TBL_TOKEN} {t.name}: " + " ".join(c_parts))
         return "\n".join(chunks), tbl_names, col_names
 
     def forward(

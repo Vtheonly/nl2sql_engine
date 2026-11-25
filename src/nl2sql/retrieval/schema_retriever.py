@@ -56,23 +56,49 @@ class HybridSchemaRetriever:
         self.embedder = embedder
         self._table_cache: dict[str, tuple[str, BM25Okapi, np.ndarray]] = {}
 
-    def _build_table_docs(self, bundle: SchemaBundle) -> tuple[list[list[str]], list[str]]:
+    def _build_table_docs(self, bundle: SchemaBundle) -> tuple[list[list[str]], list[str], list[list[str]]]:
+        """Return (BM25 token docs, per-column docs, table-level fallback docs).
+
+        Dense retrieval encodes every column separately and max-pools per table:
+        concatenating all columns into one 256-token string made columns 25-60 of a
+        wide table invisible to the embedder.
+        """
         tok_docs: list[list[str]] = []
+        col_docs: list[list[str]] = []
         str_docs: list[str] = []
         for t in bundle.tables:
-            col_strs = [f"{c.name} ({c.business_description or c.comment or ''})" for c in t.columns]
-            full = f"table {t.name} {t.comment or ''} columns: " + ", ".join(col_strs)
+            cols = [f"{c.name} ({c.business_description or c.comment or ''})" for c in t.columns]
+            full = f"table {t.name} {t.comment or ''} columns: " + ", ".join(cols)
             str_docs.append(full)
             tok_docs.append(_tokenize_ident(full))
-        return tok_docs, str_docs
+            col_docs.append(cols)
+        return tok_docs, str_docs, col_docs
 
     def _get_indexes(self, bundle: SchemaBundle) -> tuple[BM25Okapi, np.ndarray]:
         cached = self._table_cache.get(bundle.db_id)
         if cached and cached[0] == bundle.ddl_hash:
             return cached[1], cached[2]
-        tok_docs, str_docs = self._build_table_docs(bundle)
+        tok_docs, str_docs, col_docs = self._build_table_docs(bundle)
         bm25 = BM25Okapi(tok_docs)
-        vecs = self.embedder.encode(str_docs) if self.embedder else np.zeros((len(str_docs), 1), dtype=np.float32)
+        if self.embedder is not None:
+            flat_cols = [doc for cols in col_docs for doc in cols]
+            col_vecs = self.embedder.encode(flat_cols) if flat_cols else np.zeros((0, self.embedder.hidden_size), dtype=np.float32)
+            # Max-pool column vectors per table: one strong column match is enough to
+            # retrieve the table, regardless of how many columns it has.
+            tbl_vecs = np.zeros((len(col_docs), col_vecs.shape[1]), dtype=np.float32)
+            offset = 0
+            for i, cols in enumerate(col_docs):
+                if cols:
+                    tbl_vecs[i] = col_vecs[offset : offset + len(cols)].max(axis=0)
+                offset += len(cols)
+            # Blend the pooled column vector with the table-level doc vector so the
+            # table name/comment signal is not lost for tables with weak columns.
+            doc_vecs = self.embedder.encode(str_docs)
+            norms = np.linalg.norm(doc_vecs, axis=1, keepdims=True)
+            tbl_vecs = tbl_vecs + doc_vecs / np.maximum(norms, 1e-8)
+            vecs = tbl_vecs
+        else:
+            vecs = np.zeros((len(str_docs), 1), dtype=np.float32)
         self._table_cache[bundle.db_id] = (bundle.ddl_hash, bm25, vecs)
         return bm25, vecs
 
@@ -84,12 +110,18 @@ class HybridSchemaRetriever:
         max_candidate_tables: int = 24,
     ) -> RetrievalResult:
         val_hits = value_index.probe(question, top_k=8) if value_index else []
+        # Registered example queries (per-database adaptation signal) ride along with
+        # the retrieval result; the engine injects them into the parser prompt.
+        hints = [dict(h) for h in (bundle.example_queries or [])[:3]]
         if len(bundle.tables) <= max_candidate_tables:
-            return RetrievalResult(candidate_tables=bundle.tables, value_matches=val_hits)
+            return RetrievalResult(candidate_tables=bundle.tables, value_matches=val_hits, example_hints=hints)
 
         bm25, tbl_vecs = self._get_indexes(bundle)
         q_toks = _tokenize_ident(question)
         bm25_scores = np.array(bm25.get_scores(q_toks), dtype=np.float32)
+        # BM25Okapi emits negative scores for terms present in > half the documents;
+        # clipping keeps the blend with cosine similarity monotonic.
+        bm25_scores = np.maximum(bm25_scores, 0.0)
         if bm25_scores.max() > 0:
             bm25_scores = bm25_scores / bm25_scores.max()
 
@@ -129,4 +161,4 @@ class HybridSchemaRetriever:
         ordered_names = [t.name for _, t in combined if t.name in picked]
         picked_set = set(ordered_names)
         extras = [n for n in picked if n not in picked_set]
-        return RetrievalResult(candidate_tables=[picked[n] for n in (ordered_names + extras)[:max_candidate_tables]], value_matches=val_hits)
+        return RetrievalResult(candidate_tables=[picked[n] for n in (ordered_names + extras)[:max_candidate_tables]], value_matches=val_hits, example_hints=hints)

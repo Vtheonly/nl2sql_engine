@@ -9,12 +9,14 @@ from typing import Any, Optional
 import sqlglot
 from sqlglot import exp
 from pydantic import BaseModel, Field
-import torch
 from torch.utils.data import Dataset
 
-from nl2sql.db.introspect import SchemaBundle, TableInfo, introspect_database
+from nl2sql.db.introspect import SchemaBundle, TableInfo, compute_ddl_hash, introspect_database
 from nl2sql.db.value_index import ValueIndex, ValueMatch
 from nl2sql.datasets.acquire import DatasetAcquisitionResult
+from nl2sql.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class ExampleRecord(BaseModel):
@@ -28,10 +30,19 @@ class ExampleRecord(BaseModel):
     difficulty: str = "unknown"
     gold_tables: list[str] = Field(default_factory=list)
     gold_columns: list[str] = Field(default_factory=list)  # table.column
+    # ValueIndex hits for the question, precomputed once during preparation (records
+    # used to re-probe FTS5 on every __getitem__ across every epoch).
+    value_matches: list[ValueMatch] = Field(default_factory=list)
 
 
 def extract_gold_schema_targets(sql: str, bundle: SchemaBundle) -> tuple[list[str], list[str]]:
-    """Parse SQL via SQLGlot to identify ground-truth tables and table.column pairs."""
+    """Parse SQL via SQLGlot to identify ground-truth tables and table.column pairs.
+
+    Unqualified column names are resolved only when they exist in exactly one gold
+    table; genuinely ambiguous references (``SELECT id FROM a JOIN b``) and output
+    aliases shadowing a column name are skipped instead of poisoning labels across
+    every joined table.
+    """
     try:
         parsed = sqlglot.parse_one(sql, read="sqlite")
     except Exception:
@@ -47,6 +58,12 @@ def extract_gold_schema_targets(sql: str, bundle: SchemaBundle) -> tuple[list[st
                 alias_to_table[tbl.alias.lower()] = t_obj.name
             alias_to_table[t_obj.name.lower()] = t_obj.name
 
+    select_aliases = {
+        e.alias.lower()
+        for e in parsed.expressions
+        if isinstance(e, exp.Alias) and e.alias
+    } if isinstance(parsed, exp.Select) else set()
+
     gold_cols_set: set[str] = set()
     for col in parsed.find_all(exp.Column):
         cname = col.name
@@ -57,12 +74,17 @@ def extract_gold_schema_targets(sql: str, bundle: SchemaBundle) -> tuple[list[st
             t_obj = bundle.get_table(tname)
             if t_obj and t_obj.get_column(cname):
                 gold_cols_set.add(f"{t_obj.name}.{t_obj.get_column(cname).name}")
-        else:
-            for tname in gold_tables_set:
-                t_obj = bundle.get_table(tname)
-                c_obj = t_obj.get_column(cname) if t_obj else None
-                if c_obj:
-                    gold_cols_set.add(f"{t_obj.name}.{c_obj.name}")
+        elif not col.table:
+            # Output aliases (ORDER BY total) are not schema columns.
+            if cname.lower() in select_aliases:
+                continue
+            # Unqualified: only resolve when exactly one gold table has this column.
+            matches = [
+                t_obj for tname in gold_tables_set
+                if (t_obj := bundle.get_table(tname)) is not None and t_obj.get_column(cname) is not None
+            ]
+            if len(matches) == 1:
+                gold_cols_set.add(f"{matches[0].name}.{matches[0].get_column(cname).name}")
     return sorted(gold_tables_set), sorted(gold_cols_set)
 
 
@@ -97,9 +119,17 @@ def build_db_caches(
         bundle_path = db_cache / "schema_bundle.json"
         val_path = db_cache / "value_index.sqlite"
         conn_url = f"sqlite:///{sqlite_path.resolve()}"
+        bundle: Optional[SchemaBundle] = None
         if bundle_path.exists():
-            bundle = SchemaBundle.load(bundle_path)
-        else:
+            cached = SchemaBundle.load(bundle_path)
+            # Never serve a stale bundle: verify the DDL hash against the live DB and
+            # re-introspect when tables/columns changed since the cache was written.
+            live_hash = compute_ddl_hash(conn_url)
+            if live_hash == cached.ddl_hash:
+                bundle = cached
+            else:
+                logger.warning("Cached schema for db_id '%s' is stale (DDL changed); re-introspecting.", db_id)
+        if bundle is None:
             bundle = introspect_database(conn_url, db_id=db_id, column_meanings=column_meanings)
             bundle.save(bundle_path)
         v_index = ValueIndex(val_path)
@@ -141,7 +171,18 @@ def prepare_records(
     if acq.spider_dev_jsonl and acq.spider_db_root:
         _read_jsonl(acq.spider_dev_jsonl, acq.spider_db_root, raw_test_items)
 
-    all_db_paths = {row["db_id"]: db_p for row, db_p in (raw_train_items + raw_test_items)}
+    all_db_paths: dict[str, Path] = {}
+    for row, db_p in raw_train_items + raw_test_items:
+        db_id = row["db_id"]
+        prior = all_db_paths.get(db_id)
+        if prior is not None and prior.resolve() != db_p.resolve():
+            # BIRD and Spider can legitimately share db_id strings; overwriting one
+            # with the other would silently train and evaluate against the wrong DB.
+            raise ValueError(
+                f"db_id '{db_id}' is provided by two different databases: '{prior}' and '{db_p}'. "
+                "Disable one dataset or namespace its db_ids before combining BIRD + Spider."
+            )
+        all_db_paths[db_id] = db_p
     caches = build_db_caches(
         all_db_paths,
         cache_dir=cache_dir,
@@ -158,8 +199,11 @@ def prepare_records(
     def _to_records(items: list[tuple[dict, Path]]) -> list[ExampleRecord]:
         out: list[ExampleRecord] = []
         for row, db_p in items:
-            bundle, _ = caches[row["db_id"]]
+            bundle, v_idx = caches[row["db_id"]]
             g_tbls, g_cols = extract_gold_schema_targets(row["sql"], bundle)
+            # Precompute FTS5 value hits once: they only depend on (question, db),
+            # never on the epoch or the training stage.
+            val_hits = v_idx.probe(row["question"], top_k=6)
             out.append(
                 ExampleRecord(
                     id=row["id"],
@@ -172,15 +216,69 @@ def prepare_records(
                     difficulty=row.get("difficulty", "unknown"),
                     gold_tables=g_tbls,
                     gold_columns=g_cols,
+                    value_matches=val_hits,
                 )
             )
         return out
 
+    def _drop_unlinkable(records: list[ExampleRecord], split: str) -> list[ExampleRecord]:
+        """Records whose SQL yields no gold tables would train the parser to produce
+        SQL from random distractor tables alone; drop them (and say how many)."""
+        kept = [r for r in records if r.gold_tables]
+        dropped = len(records) - len(kept)
+        if dropped:
+            logger.warning(
+                "Dropped %d/%d '%s' records with no resolvable gold tables (unparseable SQL or unknown tables).",
+                dropped, len(records), split,
+            )
+        return kept
+
     full_train = _to_records(raw_train_items)
-    train_split = [r for r in full_train if r.db_id not in val_db_set]
-    val_split = [r for r in full_train if r.db_id in val_db_set]
+    train_split = _drop_unlinkable([r for r in full_train if r.db_id not in val_db_set], "train")
+    val_split = _drop_unlinkable([r for r in full_train if r.db_id in val_db_set], "val")
     test_split = _to_records(raw_test_items)
     return train_split, val_split, test_split, caches
+
+
+def load_minidev_records(
+    acq: DatasetAcquisitionResult,
+    caches: dict[str, tuple[SchemaBundle, ValueIndex]],
+) -> list[ExampleRecord]:
+    """Load the BIRD mini-dev benchmark rows as evaluation records.
+
+    ``acquire_all_datasets`` downloads and verifies this split, but it was previously
+    never exposed to the pipeline. Mini-dev shares the dev database set, so the
+    already-built caches are reused.
+    """
+    if not acq.bird_minidev_jsonl or not acq.bird_minidev_jsonl.exists():
+        return []
+    if not acq.bird_dev_db_root:
+        return []
+    out: list[ExampleRecord] = []
+    for line in acq.bird_minidev_jsonl.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if row["db_id"] not in caches:
+            continue
+        bundle, v_idx = caches[row["db_id"]]
+        g_tbls, g_cols = extract_gold_schema_targets(row["sql"], bundle)
+        out.append(
+            ExampleRecord(
+                id=row["id"],
+                source=row.get("source", "bird_minidev"),
+                db_id=row["db_id"],
+                db_path=acq.bird_dev_db_root / row["db_id"] / f"{row['db_id']}.sqlite",
+                question=row["question"],
+                evidence=row.get("evidence", ""),
+                sql=row["sql"],
+                difficulty=row.get("difficulty", "unknown"),
+                gold_tables=g_tbls,
+                gold_columns=g_cols,
+                value_matches=v_idx.probe(row["question"], top_k=6),
+            )
+        )
+    return out
 
 
 def format_schema_for_parser(
@@ -189,11 +287,17 @@ def format_schema_for_parser(
     value_matches: list[ValueMatch],
     question: str,
     evidence: str = "",
+    example_hints: Optional[list[dict[str, str]]] = None,
 ) -> str:
     tbl_names = {t.name for t in tables}
     parts = [f"Question: {question}"]
     if evidence.strip():
         parts.append(f"Hint: {evidence.strip()}")
+    if example_hints:
+        # Registered example queries ground the parser on unseen enterprise databases
+        # (the StructCBR-style adaptation signal at inference time).
+        lines = [f"Q: {h.get('question', '')} SQL: {h.get('sql', h.get('query', ''))}" for h in example_hints[:3]]
+        parts.append("Example Queries:\n" + "\n".join(lines))
     if value_matches:
         vals = "; ".join(f"{v.table_name}.{v.column_name} = '{v.value}'" for v in value_matches[:6])
         parts.append(f"Matched Values: {vals}")
@@ -211,7 +315,7 @@ def format_schema_for_parser(
         for e in bundle.join_edges
         if e.left_table in tbl_names and e.right_table in tbl_names
     ]
-    parts.append("Schema:\n" + "\n".join(schema_lines))
+    parts.append("[SCHEMA] Schema:\n" + "\n".join(schema_lines))
     if fk_lines:
         parts.append("Foreign Keys: " + "; ".join(fk_lines))
     return "\n".join(parts)
@@ -269,7 +373,9 @@ class LinkerDataset(Dataset):
         bundle, v_index = self.caches[rec.db_id]
         if self.perturb_prob > 0 and self.rng.random() < self.perturb_prob:
             bundle, _ = perturb_schema_bundle(bundle, rec.sql, self.rng)
-        val_hits = v_index.probe(rec.question, top_k=5)
+        # Hits precomputed once in prepare_records(); probe only as a legacy fallback
+        # for records constructed ad hoc (tests, external callers).
+        val_hits = rec.value_matches or v_index.probe(rec.question, top_k=5)
         gold_tbl_set = {t.lower() for t in rec.gold_tables}
         gold_col_set = {c.lower() for c in rec.gold_columns}
 
@@ -316,7 +422,11 @@ class ParserDataset(Dataset):
         bundle, v_index = self.caches[rec.db_id]
         if self.perturb_prob > 0 and self.rng.random() < self.perturb_prob:
             bundle, _ = perturb_schema_bundle(bundle, rec.sql, self.rng)
-        val_hits = v_index.probe(rec.question, top_k=6)
+        # Hits precomputed once in prepare_records(); probe only as a legacy fallback.
+        val_hits = rec.value_matches or v_index.probe(rec.question, top_k=6)
+
+        # Records without gold tables were filtered out during preparation; guard
+        # anyway so a distractor-only prompt can never be trained on.
 
         # During training, retain all gold tables + up to 4 distractor tables so model handles noise
         gold_set = {t.lower() for t in rec.gold_tables}

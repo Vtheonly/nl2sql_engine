@@ -7,7 +7,7 @@ from typing import Any, Optional
 from nl2sql.artifacts.hub import HubArtifactManager
 from nl2sql.config import EngineConfig, load_config, save_config
 from nl2sql.datasets.acquire import DatasetAcquisitionResult, acquire_all_datasets
-from nl2sql.datasets.prepare import ExampleRecord, prepare_records
+from nl2sql.datasets.prepare import ExampleRecord, load_minidev_records, prepare_records
 from nl2sql.db.introspect import SchemaBundle
 from nl2sql.db.value_index import ValueIndex
 from nl2sql.engine import NL2SQLEngine
@@ -27,6 +27,7 @@ class NL2SQLPipeline:
         self.train_records: list[ExampleRecord] = []
         self.val_records: list[ExampleRecord] = []
         self.test_records: list[ExampleRecord] = []
+        self.minidev_records: list[ExampleRecord] = []
         self.caches: dict[str, tuple[SchemaBundle, ValueIndex]] = {}
 
         run_dir = Path(cfg.training.output_dir)
@@ -47,10 +48,14 @@ class NL2SQLPipeline:
             seed=self.cfg.seed,
             max_distinct_per_col=self.cfg.data.max_distinct_values_per_col,
         )
+        # BIRD mini-dev shares the dev database caches; expose it as its own split so
+        # the downloaded benchmark is actually usable (previously dead on disk).
+        self.minidev_records = load_minidev_records(self.acq, self.caches)
         summary = {
             "train_examples": len(self.train_records),
             "val_examples": len(self.val_records),
             "test_examples": len(self.test_records),
+            "minidev_examples": len(self.minidev_records),
             "cached_databases": len(self.caches),
         }
         logger.info("Prepared data summary: %s", summary)
@@ -84,7 +89,12 @@ class NL2SQLPipeline:
     ) -> EvalMetrics:
         if not self.caches:
             self.prepare_data()
-        records = self.val_records if split == "val" else self.test_records
+        if split == "val":
+            records = self.val_records
+        elif split == "minidev":
+            records = self.minidev_records
+        else:
+            records = self.test_records
         if max_samples is not None:
             records = records[:max_samples]
 

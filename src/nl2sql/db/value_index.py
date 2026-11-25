@@ -23,8 +23,24 @@ def _is_text_like(dtype: str) -> bool:
     return any(k in d for k in ("char", "text", "varchar", "string", "clob", "enum"))
 
 
+# Stopword set for unigram probing (matched case-insensitively). Single-letter
+# English words are excluded so genuine enum codes ('A', 'F', 'M', 'Y') survive.
+_UNIGRAM_STOPWORDS = {
+    "the", "and", "for", "with", "from", "what", "which", "how",
+    "many", "much", "show", "list", "find", "give", "where", "who",
+    "average", "total", "count", "sum", "max", "min", "top", "most",
+    "a", "i", "of", "in", "is", "on", "to", "by", "or", "as", "at",
+}
+
+
 def _clean_fts_token(token: str) -> str:
-    return re.sub(r"[^0-9a-zA-Z_\s.-]", " ", token).strip()
+    # Unicode-aware: keep letters/digits/underscore (any script) so accented and CJK
+    # values survive normalization instead of being stripped to nothing.
+    return re.sub(r"[^\w\s.-]", " ", token, flags=re.UNICODE).strip()
+
+
+def _norm_cell_value(s: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^\w]+", " ", s.lower(), flags=re.UNICODE)).strip()
 
 
 class ValueIndex:
@@ -86,7 +102,7 @@ class ValueIndex:
                             s = str(val).strip()
                             if not s or len(s) > 120:
                                 continue
-                            norm = re.sub(r"\s+", " ", re.sub(r"[^0-9a-zA-Z]+", " ", s.lower())).strip()
+                            norm = _norm_cell_value(s)
                             batch.append((table.name, col.name, s, norm))
                         if batch:
                             idx_conn.executemany(
@@ -103,16 +119,23 @@ class ValueIndex:
         return total_rows
 
     def probe(self, question: str, top_k: int = 8) -> list[ValueMatch]:
-        words = [w for w in re.findall(r"[A-Za-z0-9_.-]+", question) if len(w) >= 2]
+        # Unicode word extraction: \w keeps accented letters and CJK, unlike the old
+        # ASCII-only pattern which turned "São Paulo" into "S", "o", "Paulo".
+        words = [w for w in re.findall(r"\w+", question, flags=re.UNICODE) if w]
+        # Single-letter enum codes quoted in the question ('A', 'F') are kept even
+        # though bare single letters are usually noise.
+        quoted_singles = {
+            q.strip()
+            for q in re.findall(r"['\"]([^'\"]{1,2})['\"]", question)
+            if q.strip()
+        }
         ngrams: list[str] = []
         for n in (4, 3, 2, 1):
             for i in range(len(words) - n + 1):
                 phrase = " ".join(words[i : i + n])
-                if n == 1 and phrase.lower() in {
-                    "the", "and", "for", "with", "from", "what", "which", "how",
-                    "many", "much", "show", "list", "find", "give", "where", "who",
-                    "average", "total", "count", "sum", "max", "min", "top", "most",
-                }:
+                if n == 1 and phrase.lower() in _UNIGRAM_STOPWORDS and phrase not in quoted_singles:
+                    continue
+                if n == 1 and len(phrase) == 1 and phrase.lower() in {"a", "i"} and phrase not in quoted_singles:
                     continue
                 ngrams.append(phrase)
 
@@ -127,7 +150,7 @@ class ValueIndex:
             probe_phrases = multi_grams + single_grams
             for phrase in probe_phrases:
                 cleaned = _clean_fts_token(phrase)
-                tokens = [t for t in cleaned.split() if len(t) >= 2]
+                tokens = [t for t in cleaned.split() if t]
                 if not tokens:
                     continue
                 fts_query = " AND ".join(f'"{t}"' for t in tokens)

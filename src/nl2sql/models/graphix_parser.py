@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 import threading
 from pathlib import Path
@@ -24,13 +23,76 @@ REL_VALUE_MATCH = 3
 REL_QUESTION_EXACT = 4
 NUM_REL_TYPES = 5
 
+# Unambiguous schema-section marker. Prompt text is free-form (and may legitimately
+# contain the word "schema"), so the question/schema boundary must never be inferred
+# from a plain English word.
+SCHEMA_TOKEN = "[SCHEMA]"
+TBL_TOKEN = "[TBL]"
+COL_TOKEN = "[COL]"
+
+# Tokens that terminate a column-name span in the serialized schema prompt. The
+# prompt renders columns as ``[COL] <name> <TYPE> [PK] ex=(...) -- description``.
+_TYPE_TOKENS = {
+    "integer", "int", "text", "real", "blob", "numeric", "varchar", "char",
+    "string", "boolean", "bool", "date", "datetime", "timestamp", "float",
+    "double", "decimal", "primary", "key", "not", "null", "references",
+}
+
+
+def _clean_token(tok: Any) -> str:
+    """Normalize a sentencepiece/BPE surface form for structural comparisons."""
+    return str(tok).replace("Ġ", "").replace("▁", "").lower()
+
+
+def _norm_ident(text: str) -> str:
+    """Case/space/punctuation-insensitive identifier key (handles quoted names)."""
+    return re.sub(r"[^0-9a-z_]", "", str(text).lower())
+
+
+def _norm_word(text: str) -> str:
+    """Unicode-aware word key used for question/value token matching."""
+    return re.sub(r"[^\w]", "", str(text).lower(), flags=re.UNICODE)
+
+
+def _ebnf_literal(text: str) -> str:
+    return '"' + str(text).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _ident_alternatives(name: str) -> list[str]:
+    """Unquoted, double-quoted and backtick-quoted spellings of one identifier."""
+    return [
+        _ebnf_literal(name),
+        _ebnf_literal(f'"{name}"'),
+        _ebnf_literal(f"`{name}`"),
+    ]
+
 
 def build_sqlite_schema_ebnf(tables: list[TableInfo], value_matches: list[ValueMatch]) -> str:
-    """Construct compact EBNF constraining SQL tokens to valid syntax and linked schema symbols."""
-    tbl_alts = " | ".join(f'"{t.name}"' for t in tables) or '"dual"'
+    """Construct compact EBNF constraining SQL tokens to valid syntax and linked schema symbols.
+
+    The grammar is deliberately grounded: every table/column reference must resolve to
+    a symbol that actually exists in the linked schema. Alias-qualified references are
+    allowed, but only when the column part is a real column (``c.name``), never an
+    arbitrary ``foo.bar`` pair.
+    """
+    tbl_alts = " | ".join(alt for t in tables for alt in _ident_alternatives(t.name)) or '"dual"'
     col_names = sorted({c.name for t in tables for c in t.columns})
-    qual_cols = sorted({f"{t.name}.{c.name}" for t in tables for c in t.columns})
-    col_alts = " | ".join(f'"{c}"' for c in (qual_cols + col_names)) or '"*"'
+    col_only_alts = " | ".join(alt for c in col_names for alt in _ident_alternatives(c)) or '"*"'
+
+    qual_alts: list[str] = []
+    for t in tables:
+        for c in t.columns:
+            # Unquoted, per-identifier quoted, and backtick spellings of a qualified ref.
+            qual_alts.append(_ebnf_literal(f"{t.name}.{c.name}"))
+            qual_alts.append(_ebnf_literal(f'"{t.name}"."{c.name}"'))
+            qual_alts.append(_ebnf_literal(f"`{t.name}`.`{c.name}`"))
+            qual_alts.append(_ebnf_literal(f"{t.name}.\"{c.name}\""))
+            qual_alts.append(_ebnf_literal(f'"{t.name}".{c.name}'))
+    all_col_alts: list[str] = list(qual_alts)
+    for c in col_names:
+        all_col_alts.extend(_ident_alternatives(c))
+    col_alts = " | ".join(dict.fromkeys(all_col_alts)) or '"*"'
+
     lit_vals = sorted({v.value.replace('"', '\\"') for v in value_matches if "'" not in v.value})
     extra_strs = " | ".join(f'"\'{v}\'"' for v in lit_vals)
 
@@ -42,41 +104,45 @@ def build_sqlite_schema_ebnf(tables: list[TableInfo], value_matches: list[ValueM
     return rf"""
 root ::= ws? query ws?
 query ::= with_clause? select_core (ws set_op ws select_core)* order_clause? limit_clause?
-with_clause ::= "WITH" ws cte_item ("," ws cte_item)* ws
-cte_item ::= ident ws "AS" ws "(" ws select_core ws ")"
+with_clause ::= "WITH" ws ("RECURSIVE" ws)? cte_item ("," ws cte_item)* ws
+cte_item ::= ident ws "AS" ws "(" ws? select_core ws? ")"
 set_op ::= "UNION" (ws "ALL")? | "INTERSECT" | "EXCEPT"
-select_core ::= "SELECT" ws ("DISTINCT" ws)? select_list ws from_clause where_clause? group_clause? having_clause?
+select_core ::= "SELECT" ws ("DISTINCT" ws)? select_list (ws from_clause)? where_clause? group_clause? having_clause?
 select_list ::= select_item ("," ws select_item)*
-select_item ::= ("*" | expr) (ws "AS" ws ident)?
+select_item ::= ("*" | table_name "." "*" | expr) (ws "AS" ws ident)?
 from_clause ::= "FROM" ws table_ref (ws join_clause)*
-table_ref ::= (table_name | "(" ws select_core ws ")") (ws ("AS" ws)? ident)?
-join_clause ::= (("INNER" | "LEFT" | "CROSS") ws)? "JOIN" ws table_ref (ws "ON" ws cond)?
+table_ref ::= (table_name | "(" ws? select_core ws? ")") (ws ("AS" ws)? ident)?
+join_clause ::= join_type? "JOIN" ws table_ref join_condition?
+join_type ::= ("INNER" | "LEFT" (ws "OUTER")? | "RIGHT" (ws "OUTER")? | "FULL" (ws "OUTER")? | "CROSS") ws
+join_condition ::= (ws "ON" ws cond) | (ws "USING" ws "(" ws? ident ("," ws ident)* ws? ")")
 where_clause ::= ws "WHERE" ws cond
 group_clause ::= ws "GROUP BY" ws expr ("," ws expr)*
 having_clause ::= ws "HAVING" ws cond
 order_clause ::= ws "ORDER BY" ws order_item ("," ws order_item)*
 order_item ::= expr (ws ("ASC" | "DESC"))?
-limit_clause ::= ws "LIMIT" ws [0-9]+
+limit_clause ::= ws "LIMIT" ws [0-9]+ (ws "," ws [0-9]+ | (ws "OFFSET" ws [0-9]+)?)?
 cond ::= cond_atom (ws ("AND" | "OR") ws cond_atom)*
 cond_atom ::= ("NOT" ws)? (
     expr ws comp_op ws expr
-    | expr ws ("NOT" ws)? "IN" ws "(" ws (select_core | expr ("," ws expr)*) ws ")"
+    | expr ws ("NOT" ws)? "IN" ws "(" ws? (select_core | expr ("," ws expr)*) ws? ")"
     | expr ws ("NOT" ws)? "BETWEEN" ws expr ws "AND" ws expr
     | expr ws ("NOT" ws)? "LIKE" ws expr
     | expr ws "IS" ws ("NOT" ws)? "NULL"
-    | "EXISTS" ws "(" ws select_core ws ")"
-    | "(" ws cond ws ")"
+    | "EXISTS" ws "(" ws? select_core ws? ")"
+    | "(" ws? cond ws? ")"
 )
 comp_op ::= "=" | "!=" | "<>" | "<" | "<=" | ">" | ">="
 expr ::= term (ws ("+" | "-" | "*" | "/" | "||") ws term)*
-term ::= agg_call | scalar_call | case_expr | col_ref | literal | "(" ws (expr | select_core) ws ")"
+term ::= agg_call | scalar_call | case_expr | col_ref | literal | "(" ws? (expr | select_core) ws? ")"
 agg_call ::= ("COUNT" | "SUM" | "AVG" | "MIN" | "MAX") "(" ("DISTINCT" ws)? ("*" | expr) ")"
-scalar_call ::= ("ABS" | "ROUND" | "CAST" | "COALESCE" | "IFNULL" | "IIF" | "STRFTIME" | "SUBSTR" | "LENGTH" | "LOWER" | "UPPER" | "JULIANDAY") "(" expr ("," ws (expr | "AS" ws [A-Z]+))* ")"
-case_expr ::= "CASE" (ws "WHEN" ws cond ws "THEN" ws expr)+ (ws "ELSE" ws expr)? ws "END"
+scalar_call ::= ("ABS" | "ROUND" | "CAST" | "COALESCE" | "IFNULL" | "IIF" | "STRFTIME" | "SUBSTR" | "LENGTH" | "LOWER" | "UPPER" | "JULIANDAY") "(" expr (ws "AS" ws type_name | ("," ws expr)*) ")"
+type_name ::= [A-Za-z]+ (ws "(" ws [0-9]+ ("," ws [0-9]+)? ws ")")?
+case_expr ::= "CASE" (ws expr)? (ws "WHEN" ws cond ws "THEN" ws expr)+ (ws "ELSE" ws expr)? ws "END"
 literal ::= "-"? [0-9]+ ("." [0-9]+)? | {string_rule} | "NULL"
 table_name ::= {tbl_alts}
-col_ref ::= {col_alts} | ident "." (ident | "*")
-ident ::= [a-zA-Z_][a-zA-Z0-9_]*
+col_ref ::= ({col_alts}) | ident "." ({col_only_alts})
+ident ::= [a-zA-Z_][a-zA-Z0-9_]* | quoted_ident
+quoted_ident ::= "\"" [^"\n\r]* "\"" | "`" [^`\n\r]* "`" | "[" [^\]\n\r]* "]"
 ws ::= [ \t\n]+
 """
 
@@ -94,6 +160,7 @@ class Seq2SeqXGrammarLogitsProcessor(LogitsProcessor):
         vocab_size: int,
         start_len: int = 1,
         eos_token_id: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
     ) -> None:
         import xgrammar as xgr
 
@@ -102,9 +169,35 @@ class Seq2SeqXGrammarLogitsProcessor(LogitsProcessor):
         self.vocab_size = vocab_size
         self.start_len = start_len
         self.eos_token_id = eos_token_id
+        self.pad_token_id = pad_token_id
         self.matchers: list[Any] = []
         self._dead_rows: set[int] = set()
         self.bitmask: Optional[torch.Tensor] = None
+
+    def _reset_row_to_eos(self, row: int) -> None:
+        """Allow only EOS (and PAD) on a terminated row.
+
+        The bitmask is allocated once per generation batch. Without an explicit reset,
+        a terminated row keeps whatever tokens were legal at step ``t-1``, so the
+        ``(bitmask == 0).all(dim=1)`` EOS-fallback guard never fires and generation
+        can continue past a complete statement.
+        """
+        assert self.bitmask is not None
+        self.bitmask[row].zero_()
+        allowed = [tid for tid in (self.eos_token_id, self.pad_token_id) if tid is not None and 0 <= tid < self.vocab_size]
+        if not allowed:
+            # No stop token configured: leave the row unconstrained rather than
+            # producing an all -inf row (which yields NaN sampling).
+            self.bitmask[row].fill_(-1)
+            return
+        for tid in allowed:
+            word, bit = divmod(int(tid), 32)
+            self.bitmask[row, word] |= 1 << bit
+
+    def _reset_row_unconstrained(self, row: int) -> None:
+        """Dead rows must not inherit stale grammar bits from a previous step."""
+        assert self.bitmask is not None
+        self.bitmask[row].fill_(-1)
 
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
         batch_size = input_ids.shape[0]
@@ -127,14 +220,19 @@ class Seq2SeqXGrammarLogitsProcessor(LogitsProcessor):
                     self._dead_rows.add(i)
 
         for i in range(batch_size):
-            if i in self._dead_rows or self.matchers[i].is_terminated():
+            if i in self._dead_rows:
+                self._reset_row_unconstrained(i)
+                continue
+            if self.matchers[i].is_terminated():
+                self._reset_row_to_eos(i)
                 continue
             try:
                 self.matchers[i].fill_next_token_bitmask(self.bitmask, i)
             except Exception:
                 self._dead_rows.add(i)
+                self._reset_row_unconstrained(i)
 
-        # Robustness guard: a fully-masked row (terminated matcher, dead row, or a vocab with no
+        # Robustness guard: a fully-masked row (dead row, terminated row, or a vocab with no
         # grammar-reachable token) must never produce all -inf logits, which yields NaN sampling.
         self._ensure_eos_fallback(batch_size)
 
@@ -148,7 +246,7 @@ class Seq2SeqXGrammarLogitsProcessor(LogitsProcessor):
         empty_rows = (self.bitmask == 0).all(dim=1).nonzero(as_tuple=True)[0]
         if len(empty_rows) == 0:
             return
-        word, bit = divmod(self.eos_token_id, 32)
+        word, bit = divmod(int(self.eos_token_id), 32)
         for i in empty_rows.tolist():
             if i < batch_size:
                 self.bitmask[i, word] |= 1 << bit
@@ -162,7 +260,7 @@ class GraphixCodeT5Parser(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(model_id_or_path)
         self.model = T5ForConditionalGeneration.from_pretrained(model_id_or_path)
         added = self.tokenizer.add_special_tokens(
-            {"additional_special_tokens": ["[TBL]", "[COL]", "[PK]", "[FK]", "[VAL]"]}
+            {"additional_special_tokens": [TBL_TOKEN, COL_TOKEN, "[PK]", "[FK]", "[VAL]", SCHEMA_TOKEN]}
         )
         if added > 0:
             self.model.resize_token_embeddings(len(self.tokenizer))
@@ -207,6 +305,132 @@ class GraphixCodeT5Parser(nn.Module):
         attn_mod.compute_bias = wrapped_compute_bias
 
     @staticmethod
+    def _find_schema_anchor(toks: list[Any]) -> int:
+        """Index of the first schema-section token, or len(toks) when absent.
+
+        Prefers the explicit ``[SCHEMA]`` marker; falls back to the legacy ``Schema:``
+        header for prompts produced before the marker existed.
+        """
+        for idx, tok in enumerate(toks):
+            if str(tok) == SCHEMA_TOKEN or _clean_token(tok) == _clean_token(SCHEMA_TOKEN):
+                return idx
+        for idx, tok in enumerate(toks):
+            clean = _clean_token(tok)
+            if clean == "schema:":
+                return idx
+            if clean.startswith("schema") and not clean[6:].strip(":"):
+                return idx
+        return len(toks)
+
+    @staticmethod
+    def _parse_schema_owners(
+        toks: list[Any],
+        tables: list[TableInfo],
+        q_end: int,
+    ) -> tuple[list[Optional[str]], list[Optional[str]]]:
+        """Map each schema token to its owning table/column (lowercase names).
+
+        Names are matched by longest prefix against the known schema identifiers, so
+        BPE multi-piece names (``order``/``_``/``items``) and names with spaces or
+        punctuation all resolve, without depending on a ``:`` token surviving
+        tokenization (WordLevel tokenizers map ``:`` to ``<unk>``).
+        """
+        seq_len = len(toks)
+        owner_table: list[Optional[str]] = [None] * seq_len
+        owner_col: list[Optional[str]] = [None] * seq_len
+
+        # Normalized lookup maps tolerate quoted names, spaces and punctuation.
+        t_by_norm: dict[str, TableInfo] = {}
+        for t in tables:
+            t_by_norm[_norm_ident(t.name)] = t
+        col_norm_by_table: dict[str, dict[str, str]] = {}
+        for t in tables:
+            col_norm_by_table[_norm_ident(t.name)] = {
+                _norm_ident(c.name): c.name.lower() for c in t.columns
+            }
+
+        cur_tbl: Optional[str] = None
+        cur_tbl_norm: Optional[str] = None
+        cur_col: Optional[str] = None
+
+        def _is_marker(clean: str) -> bool:
+            return clean == _clean_token(TBL_TOKEN) or clean == _clean_token(COL_TOKEN)
+
+        idx = 0
+        while idx < seq_len:
+            tok = toks[idx]
+            clean = _clean_token(tok)
+
+            if clean == _clean_token(TBL_TOKEN):
+                # Longest-prefix match of the joined token pieces against table names.
+                j = idx + 1
+                parts: list[str] = []
+                best_end, best_tbl = -1, None
+                while j < seq_len:
+                    cj = _clean_token(toks[j])
+                    if _is_marker(cj) or cj == ":" or cj.endswith(":"):
+                        if cj != ":" and cj.endswith(":"):
+                            parts.append(cj[:-1])
+                            cand = _norm_ident("".join(parts))
+                            if t_by_norm.get(cand) is not None:
+                                best_end, best_tbl = j + 1, t_by_norm[cand]
+                        break
+                    parts.append(cj)
+                    cand = _norm_ident("".join(parts))
+                    if t_by_norm.get(cand) is not None:
+                        best_end, best_tbl = j + 1, t_by_norm[cand]
+                    j += 1
+                if best_tbl is not None and best_end > 0:
+                    cur_tbl = best_tbl.name.lower()
+                    cur_tbl_norm = _norm_ident(cur_tbl)
+                    cur_col = None
+                    # Cover the full span including the trailing ':' separator token.
+                    for k in range(idx, min(j + 1, seq_len)):
+                        owner_table[k] = cur_tbl
+                else:
+                    cur_tbl = cur_tbl_norm = None
+                    cur_col = None
+                idx = j if j < seq_len else seq_len
+                continue
+
+            if clean == _clean_token(COL_TOKEN):
+                # Longest-prefix match against the current table's column names.
+                j = idx + 1
+                parts = []
+                best_end, best_col = -1, None
+                cols = col_norm_by_table.get(cur_tbl_norm or "", {})
+                while j < seq_len:
+                    cj = _clean_token(toks[j])
+                    if (
+                        _is_marker(cj)
+                        or (j > idx + 1 and (cj in _TYPE_TOKENS or not cj))
+                        or cj.startswith("--")
+                        or "=" in cj
+                    ):
+                        break
+                    parts.append(cj)
+                    cand = _norm_ident("".join(parts))
+                    actual = cols.get(cand)
+                    if actual is not None:
+                        best_end, best_col = j + 1, actual
+                    j += 1
+                if best_col is not None and best_end > 0:
+                    cur_col = best_col
+                    for k in range(idx, best_end):
+                        owner_table[k] = cur_tbl
+                        owner_col[k] = cur_col
+                idx = j if j < seq_len else seq_len
+                continue
+
+            if idx >= q_end and cur_tbl:
+                owner_table[idx] = cur_tbl
+                if cur_col:
+                    owner_col[idx] = cur_col
+            idx += 1
+
+        return owner_table, owner_col
+
+    @staticmethod
     def build_relation_matrix(
         input_ids: torch.Tensor,
         tokenizer: Any,
@@ -214,74 +438,82 @@ class GraphixCodeT5Parser(nn.Module):
         tables_list: list[list[TableInfo]],
         values_list: list[list[ValueMatch]],
     ) -> torch.Tensor:
-        """Build lightweight (B, L, L) token-level schema-graph edge matrix."""
+        """Build lightweight (B, L, L) token-level schema-graph edge matrix.
+
+        The per-sample work is O(L) for span parsing plus a handful of tensor block
+        fills, instead of the previous O(B * L^2) Python loops inside ``collate``.
+        """
         bsz, seq_len = input_ids.shape
         rel = torch.zeros((bsz, seq_len, seq_len), dtype=torch.long)
-        tbl_tok = "[TBL]"
-        col_tok = "[COL]"
 
         for b in range(bsz):
             toks = tokenizer.convert_ids_to_tokens(input_ids[b].tolist())
-            t_objs = {t.name.lower(): t for t in tables_list[b]}
-            cur_tbl: Optional[str] = None
-            token_table: list[Optional[str]] = [None] * seq_len
-            q_end = seq_len
+            q_end = GraphixCodeT5Parser._find_schema_anchor(toks)
+            owner_table, owner_col = GraphixCodeT5Parser._parse_schema_owners(
+                toks, tables_list[b], q_end
+            )
 
-            for idx, tok in enumerate(toks):
-                clean = tok.replace("Ġ", "").replace("▁", "").lower().rstrip(":")
-                if q_end == seq_len and idx > 0 and clean.startswith("schema") and "schema" not in clean[6:]:
-                    # Subword tokenizers split "Schema:" across tokens; anchor on its first piece
-                    q_end = idx
-                if tok == tbl_tok and idx + 1 < seq_len:
-                    nxt = toks[idx + 1].replace("Ġ", "").replace("▁", "").lower().rstrip(":")
-                    cur_tbl = nxt if nxt in t_objs else None
-                if idx >= q_end and cur_tbl:
-                    token_table[idx] = cur_tbl
-
-            # Mark SAME_TABLE spans
+            # SAME_TABLE spans: fill each table's token block in one tensor operation.
+            table_positions: dict[str, list[int]] = {}
             for i in range(q_end, seq_len):
-                if not token_table[i]:
-                    continue
-                for j in range(q_end, seq_len):
-                    if token_table[i] == token_table[j]:
-                        rel[b, i, j] = REL_SAME_TABLE
+                if owner_table[i]:
+                    table_positions.setdefault(owner_table[i], []).append(i)
+            for pos in table_positions.values():
+                idx = torch.tensor(pos, dtype=torch.long)
+                rel[b, idx[:, None], idx[None, :]] = REL_SAME_TABLE
 
-            # Mark FK_EDGE spans
+            # FK_EDGE spans between tables connected in the schema graph.
             fk_pairs = {(e.left_table.lower(), e.right_table.lower()) for e in bundles[b].join_edges}
             fk_pairs |= {(r, l) for l, r in fk_pairs}
-            for i in range(q_end, seq_len):
-                ti = token_table[i]
-                if not ti:
-                    continue
-                for j in range(q_end, seq_len):
-                    tj = token_table[j]
-                    if tj and (ti, tj) in fk_pairs:
-                        rel[b, i, j] = REL_FK_EDGE
+            for lt, rt in fk_pairs:
+                lp = table_positions.get(lt)
+                rp = table_positions.get(rt)
+                if lp and rp:
+                    li = torch.tensor(lp, dtype=torch.long)
+                    ri = torch.tensor(rp, dtype=torch.long)
+                    rel[b, li[:, None], ri[None, :]] = REL_FK_EDGE
 
-            # Mark QUESTION_EXACT token matches
+            # QUESTION_EXACT token matches.
             q_words: dict[str, list[int]] = {}
+            q_norm: list[str] = []
             for i in range(q_end):
-                w = re.sub(r"[^a-z0-9]", "", toks[i].replace("Ġ", "").replace("▁", "").lower())
+                w = _norm_word(_clean_token(toks[i]))
+                q_norm.append(w)
                 if len(w) >= 3:
                     q_words.setdefault(w, []).append(i)
             for j in range(q_end, seq_len):
-                w = re.sub(r"[^a-z0-9]", "", toks[j].replace("Ġ", "").replace("▁", "").lower())
+                w = _norm_word(_clean_token(toks[j]))
                 if w in q_words:
                     for qi in q_words[w]:
                         rel[b, qi, j] = REL_QUESTION_EXACT
                         rel[b, j, qi] = REL_QUESTION_EXACT
 
-            # Mark VALUE_MATCH spans
-            val_words = {
-                re.sub(r"[^a-z0-9]", "", v.value.lower())
-                for v in values_list[b]
-                if len(v.value) >= 2
-            }
-            for i in range(q_end):
-                w = re.sub(r"[^a-z0-9]", "", toks[i].replace("Ġ", "").replace("▁", "").lower())
-                if w in val_words:
-                    for j in range(q_end, seq_len):
-                        if token_table[j]:
+            # VALUE_MATCH: connect a matched value only to the specific table/column
+            # that produced it, and match multi-word values as token subsequences.
+            for v in values_list[b]:
+                phrase = [w for w in re.findall(r"\w+", v.value.lower(), flags=re.UNICODE) if w]
+                if not phrase:
+                    continue
+                target = [
+                    j
+                    for j in range(q_end, seq_len)
+                    if owner_table[j]
+                    and _norm_ident(owner_table[j]) == _norm_ident(v.table_name)
+                    and owner_col[j]
+                    and _norm_ident(owner_col[j]) == _norm_ident(v.column_name)
+                ]
+                if not target:
+                    target = [
+                        j
+                        for j in range(q_end, seq_len)
+                        if owner_table[j] and _norm_ident(owner_table[j]) == _norm_ident(v.table_name)
+                    ]
+                if not target:
+                    continue
+                n = len(phrase)
+                for i in range(0, max(0, len(q_norm) - n + 1)):
+                    if q_norm[i : i + n] == phrase:
+                        for j in target:
                             rel[b, i, j] = REL_VALUE_MATCH
         return rel
 
@@ -306,6 +538,15 @@ class GraphixCodeT5Parser(nn.Module):
             finally:
                 self._active_rel_bias = None
 
+    def _make_logits_processor(self, compiled: Any, eos_id: Optional[int]) -> "Seq2SeqXGrammarLogitsProcessor":
+        return Seq2SeqXGrammarLogitsProcessor(
+            compiled,
+            vocab_size=self.model.config.vocab_size,
+            start_len=1,
+            eos_token_id=eos_id,
+            pad_token_id=self.model.config.pad_token_id,
+        )
+
     @torch.no_grad()
     def generate_candidates(
         self,
@@ -319,6 +560,7 @@ class GraphixCodeT5Parser(nn.Module):
         use_xgrammar: bool = True,
     ) -> list[str]:
         self.eval()
+        num_candidates = max(1, int(num_candidates))
         device = next(self.parameters()).device
         enc = self.tokenizer(
             source_text, truncation=True, max_length=max_source_len, return_tensors="pt"
@@ -341,12 +583,10 @@ class GraphixCodeT5Parser(nn.Module):
 
         from transformers.modeling_outputs import BaseModelOutput
 
-        expanded_enc = BaseModelOutput(
-            last_hidden_state=enc_out.last_hidden_state.repeat_interleave(num_candidates, dim=0)
-        )
-        expanded_mask = enc["attention_mask"].repeat_interleave(num_candidates, dim=0)
-
-        logits_processors = []
+        compiled = None
+        eos_id = self.model.config.eos_token_id
+        if eos_id is None:
+            eos_id = self.tokenizer.eos_token_id
         if use_xgrammar and self._xgr_available and self._xgr_compiler is not None:
             try:
                 ebnf = build_sqlite_schema_ebnf(selected_tables, value_matches)
@@ -354,35 +594,44 @@ class GraphixCodeT5Parser(nn.Module):
                 # compilation together with the bias critical section to stay safe.
                 with self._bias_lock:
                     compiled = self._xgr_compiler.compile_grammar(ebnf)
-                eos_id = self.model.config.eos_token_id
-                if eos_id is None:
-                    eos_id = self.tokenizer.eos_token_id
-                logits_processors.append(
-                    Seq2SeqXGrammarLogitsProcessor(
-                        compiled,
-                        vocab_size=self.model.config.vocab_size,
-                        start_len=1,
-                        eos_token_id=eos_id,
-                    )
-                )
             except Exception as exc:
                 logger.warning("Failed to compile schema EBNF (%s); falling back to unconstrained.", exc)
+                compiled = None
 
-        gen_kwargs: dict[str, Any] = {
-            "encoder_outputs": expanded_enc,
-            "attention_mask": expanded_mask,
-            "max_new_tokens": max_target_len,
-            "num_beams": 1,
-            "logits_processor": logits_processors,
-        }
+        def _processors() -> list[Any]:
+            return [self._make_logits_processor(compiled, eos_id)] if compiled is not None else []
+
+        def _decode(outputs: torch.Tensor) -> list[str]:
+            return [self.tokenizer.decode(o, skip_special_tokens=True).strip() for o in outputs]
+
+        # Candidate 0 is always greedy: stochastic sampling must never displace the
+        # highest-likelihood SQL. Candidates 1..K-1 add diversity.
+        greedy_out = self.model.generate(
+            encoder_outputs=BaseModelOutput(last_hidden_state=enc_out.last_hidden_state),
+            attention_mask=enc["attention_mask"],
+            max_new_tokens=max_target_len,
+            num_beams=1,
+            do_sample=False,
+            logits_processor=_processors(),
+        )
+        decoded = _decode(greedy_out)
+
         if num_candidates > 1:
-            # Row 0 greedy-like low temp; diverse sampling over batch rows avoids xgrammar beam bug
-            gen_kwargs.update({"do_sample": True, "temperature": 0.45, "top_p": 0.92})
-        else:
-            gen_kwargs.update({"do_sample": False})
+            k = num_candidates - 1
+            sampled_out = self.model.generate(
+                encoder_outputs=BaseModelOutput(
+                    last_hidden_state=enc_out.last_hidden_state.repeat_interleave(k, dim=0)
+                ),
+                attention_mask=enc["attention_mask"].repeat_interleave(k, dim=0),
+                max_new_tokens=max_target_len,
+                num_beams=1,
+                do_sample=True,
+                temperature=0.45,
+                top_p=0.92,
+                logits_processor=_processors(),
+            )
+            decoded.extend(_decode(sampled_out))
 
-        outputs = self.model.generate(**gen_kwargs)
-        decoded = [self.tokenizer.decode(o, skip_special_tokens=True).strip() for o in outputs]
         # Preserve order while deduplicating
         unique: list[str] = []
         seen: set[str] = set()
@@ -405,5 +654,7 @@ class GraphixCodeT5Parser(nn.Module):
         obj = cls(model_id_or_path=str(p))
         rb = p / "graphix_rel_bias.pt"
         if rb.exists():
-            obj.rel_bias_emb.load_state_dict(torch.load(rb, map_location=map_location))
+            obj.rel_bias_emb.load_state_dict(
+                torch.load(rb, map_location=map_location, weights_only=True)
+            )
         return obj

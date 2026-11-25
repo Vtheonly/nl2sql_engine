@@ -47,6 +47,7 @@ training:
   early_stopping_patience: 3
   resume_from: auto # null | auto | explicit path
   num_workers: 2
+  gradient_checkpointing: false # true cuts activation memory for 4096-token ModernBERT training
 
 hub:
   enabled: false

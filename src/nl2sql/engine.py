@@ -7,21 +7,24 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Optional
 
-import sqlglot
 import torch
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy.engine import make_url
 
 from nl2sql.compiler.sql_compiler import SQLSecurityError, compile_and_validate_sql
 from nl2sql.config import EngineConfig
 from nl2sql.datasets.prepare import format_schema_for_parser
-from nl2sql.db.introspect import SchemaBundle, introspect_database
+from nl2sql.db.introspect import SchemaBundle, compute_ddl_hash, introspect_database
 from nl2sql.db.value_index import ValueIndex
 from nl2sql.evaluation.evaluator import execute_sqlite_readonly
 from nl2sql.models.graphix_parser import GraphixCodeT5Parser
 from nl2sql.models.schema_linker import ModernBertSchemaLinker
 from nl2sql.models.verifier import ModernBertVerifier
 from nl2sql.retrieval.schema_retriever import DenseTableEncoder, HybridSchemaRetriever
+from nl2sql.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 # Value-bearing patterns that make a question unsafe for template caching. This must
@@ -40,6 +43,10 @@ class QueryRequest(BaseModel):
     target_dialect: str = "sqlite"
     allowed_tables: Optional[list[str]] = None
     execute: bool = False
+    # Production guardrail: LIMIT injected into unaggregated SELECTs lacking LIMIT.
+    # Set to null to disable (evaluation paths must disable it, otherwise gold queries
+    # returning more rows than the cap are silently truncated and scored wrong).
+    default_limit: Optional[int] = 200
 
 
 class QueryResponse(BaseModel):
@@ -84,17 +91,74 @@ class NL2SQLEngine:
         )
 
         self.db_registry: dict[str, tuple[SchemaBundle, ValueIndex, Optional[Path]]] = {}
-        # (db_id, question skeleton, evidence, dialect, allowed-tables signature) -> SQL.
-        # Bounded LRU: entries are evicted oldest-first once the cap is reached.
-        self._template_cache: "OrderedDict[tuple[str, str, str, str, Optional[tuple[str, ...]]], str]" = OrderedDict()
+        # (db_id, question skeleton, evidence, dialect, allowed-tables signature,
+        #  limit guardrail) -> SQL. Bounded LRU: entries are evicted oldest-first once
+        # the cap is reached.
+        self._template_cache: "OrderedDict[tuple[str, str, str, str, Optional[tuple[str, ...]], Optional[int]], str]" = OrderedDict()
         self._cache_lock = threading.Lock()
 
-    def register_database(self, db_id: str, connection_url: str, cache_dir: str | Path, sqlite_path: Optional[Path] = None) -> SchemaBundle:
+        # Degraded-mode telemetry: untrained stages fall back to heuristic scores;
+        # surface that loudly instead of failing silently at query time.
+        if self.linker is None:
+            logger.warning("Linker artifact not found under %s; schema pruning falls back to truncation.", art / "linker")
+        if self.verifier is None:
+            logger.warning("Verifier artifact not found under %s; candidate ranking falls back to heuristic execution scores.", art / "verifier")
+
+    @property
+    def models_loaded(self) -> dict[str, bool]:
+        """Which pipeline stages are backed by trained artifacts (health surface)."""
+        return {
+            "retriever": True,
+            "linker": self.linker is not None,
+            "parser": True,
+            "verifier": self.verifier is not None,
+        }
+
+    def register_database(
+        self,
+        db_id: str,
+        connection_url: str,
+        cache_dir: str | Path,
+        sqlite_path: Optional[Path] = None,
+        column_meanings: Optional[dict[str, str]] = None,
+        example_queries: Optional[list[dict[str, str]]] = None,
+    ) -> SchemaBundle:
         cdir = Path(cache_dir) / db_id
         bpath = cdir / "schema_bundle.json"
-        bundle = SchemaBundle.load(bpath) if bpath.exists() else introspect_database(connection_url, db_id=db_id)
-        if not bpath.exists():
+        bundle: Optional[SchemaBundle] = None
+        if bpath.exists():
+            cached = SchemaBundle.load(bpath)
+            # Schema drift check: a cached bundle whose DDL hash no longer matches the
+            # live database would otherwise serve stale tables/columns forever.
+            try:
+                live_hash = compute_ddl_hash(connection_url)
+            except Exception as exc:
+                logger.warning("Could not hash live schema for '%s' (%s); using cached bundle.", db_id, exc)
+                live_hash = cached.ddl_hash
+            if live_hash != cached.ddl_hash:
+                logger.warning("Schema for '%s' changed on disk; rebuilding cached bundle.", db_id)
+            else:
+                bundle = cached
+        if bundle is None:
+            bundle = introspect_database(connection_url, db_id=db_id, column_meanings=column_meanings)
             bundle.save(bpath)
+        if example_queries:
+            bundle.example_queries = list(example_queries)
+            bundle.save(bpath)
+
+        # Layer 6 dry-run execution needs the SQLite file. Derive it from the
+        # connection URL so callers don't have to pass it redundantly; non-SQLite
+        # dialects keep dry-run disabled (no EXPLAIN path implemented) and warn once.
+        if sqlite_path is None:
+            try:
+                url = make_url(connection_url)
+                if url.get_backend_name() == "sqlite" and url.database:
+                    sqlite_path = Path(url.database)
+            except Exception:
+                sqlite_path = None
+        if sqlite_path is None:
+            logger.info("No SQLite path for '%s'; Layer 6 dry-run execution disabled.", db_id)
+
         v_idx = ValueIndex(cdir / "value_index.sqlite")
         if not v_idx.is_built_for(bundle.ddl_hash):
             v_idx.build_from_db(connection_url, bundle, max_distinct_per_col=self.cfg.data.max_distinct_values_per_col)
@@ -139,6 +203,7 @@ class NL2SQLEngine:
         target_dialect: str = "sqlite",
         allowed_tables: Optional[list[str]] = None,
         execute: bool = False,
+        default_limit: Optional[int] = None,
     ) -> QueryResponse:
         t0 = time.perf_counter()
         if db_id not in self.db_registry:
@@ -149,10 +214,12 @@ class NL2SQLEngine:
         # own table resolution (bundle.get_table lowercases the lookup).
         allowed_set = {t.lower() for t in allowed_tables} if allowed_tables is not None else None
 
-        # Layer 2: Retrieval & Adaptive Schema Pruning
+        # Layer 2: Retrieval & Adaptive Schema Pruning. The linker prunes whenever it
+        # is available -- skipping it for small candidate sets used to dump up to 8
+        # tables (>1k tokens) raw into the parser.
         ret = self.retriever.retrieve(norm_q, bundle, v_idx)
         cand_tables = [t for t in ret.candidate_tables if allowed_set is None or t.name.lower() in allowed_set]
-        if self.linker is not None and len(cand_tables) > self.cfg.models.linker_max_tables:
+        if self.linker is not None:
             linked_tables = self.linker.prune_schema(
                 norm_q, bundle, cand_tables, ret.value_matches, evidence=evidence,
                 threshold=self.cfg.models.linker_threshold,
@@ -164,7 +231,10 @@ class NL2SQLEngine:
             linked_tables = cand_tables[: self.cfg.models.linker_max_tables]
 
         linked_names = [t.name for t in linked_tables]
-        schema_txt = format_schema_for_parser(bundle, linked_tables, ret.value_matches, norm_q, evidence)
+        schema_txt = format_schema_for_parser(
+            bundle, linked_tables, ret.value_matches, norm_q, evidence,
+            example_hints=ret.example_hints,
+        )
 
         # Layer 3: Verified Exact/Normalized Cache Fast Path.
         # The cache key MUST include everything that can change the grounded SQL:
@@ -177,6 +247,7 @@ class NL2SQLEngine:
             evidence.strip(),
             target_dialect.strip().lower(),
             tuple(sorted(allowed_set)) if allowed_set is not None else None,
+            default_limit,
         )
         cached_sql: Optional[str] = None
         if _CACHE_UNSAFE_RE.search(norm_q) is None:
@@ -204,11 +275,17 @@ class NL2SQLEngine:
         )
 
         # Layer 5 & 7: Compile, Repair Joins, Check Fan-Out & Security Policies + Layer 6 Dry-Run
+        # default_limit=None (evaluation default) never injects LIMIT; the production
+        # API passes its request-level guardrail explicitly.
         compiled_cands = []
         exec_inputs = []
         for raw_sql in raw_cands:
             try:
-                comp = compile_and_validate_sql(raw_sql, bundle, target_dialect=target_dialect, allowed_tables=allowed_set)
+                comp = compile_and_validate_sql(
+                    raw_sql, bundle, target_dialect=target_dialect,
+                    allowed_tables=allowed_set,
+                    default_limit=default_limit if default_limit is not None else 0,
+                )
             except SQLSecurityError:
                 continue
             if sqlite_path is not None:
@@ -276,6 +353,14 @@ class NL2SQLEngine:
 def create_app(engine: NL2SQLEngine) -> FastAPI:
     app = FastAPI(title="NL2SQL Engine API", version="0.1.0")
 
+    @app.get("/health")
+    def health() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "models_loaded": engine.models_loaded,
+            "registered_databases": sorted(engine.db_registry),
+        }
+
     @app.post("/query", response_model=QueryResponse)
     def query_sql(req: QueryRequest) -> QueryResponse:
         try:
@@ -286,6 +371,7 @@ def create_app(engine: NL2SQLEngine) -> FastAPI:
                 target_dialect=req.target_dialect,
                 allowed_tables=req.allowed_tables,
                 execute=req.execute,
+                default_limit=req.default_limit,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

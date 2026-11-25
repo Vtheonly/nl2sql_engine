@@ -31,6 +31,8 @@ class EvalMetrics(BaseModel):
     abstention_rate: float = 0.0
     selective_execution_accuracy: float = 0.0
     verifier_auroc: Optional[float] = None
+    by_difficulty: dict[str, dict[str, float]] = Field(default_factory=dict)
+    by_source: dict[str, dict[str, float]] = Field(default_factory=dict)
     resource_stats: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -57,7 +59,7 @@ def execute_sqlite_readonly(
     db_path: Path,
     sql: str,
     timeout_sec: float = 3.0,
-    max_rows: int = 1000,
+    max_rows: int = 50000,
 ) -> tuple[bool, Optional[list[tuple[Any, ...]]], float, str]:
     start = time.perf_counter()
     # Guard 1 (statement gate): SQLite's `mode=ro` URI only protects the MAIN database;
@@ -93,6 +95,11 @@ def execute_sqlite_readonly(
             conn.close()
 
 
+# Integers beyond 2**53 lose low bits through float():.4f formatting (18-digit
+# account IDs would compare equal after rounding). Keep them exact as strings.
+_SAFE_FLOAT_INT_BOUND = 2 ** 53
+
+
 def _normalize_row(row: tuple[Any, ...]) -> tuple[str, ...]:
     out = []
     for v in row:
@@ -101,8 +108,16 @@ def _normalize_row(row: tuple[Any, ...]) -> tuple[str, ...]:
         # must not fail an otherwise-identical result set.
         if isinstance(v, bool):
             out.append("1" if v else "0")
-        elif isinstance(v, (int, float)):
-            out.append(f"{float(v):.4f}")
+        elif isinstance(v, int):
+            if abs(v) <= _SAFE_FLOAT_INT_BOUND:
+                out.append(f"{float(v):.4f}")
+            else:
+                out.append(str(v))
+        elif isinstance(v, float):
+            if math.isfinite(v) and abs(v) <= _SAFE_FLOAT_INT_BOUND:
+                out.append(f"{v:.4f}")
+            else:
+                out.append(repr(v))
         elif v is None:
             out.append("NULL")
         else:
@@ -158,6 +173,16 @@ class NL2SQLEvaluator:
         non_abstained_hits = 0
         verifier_scores: list[float] = []
         verifier_labels: list[int] = []
+        # Per-slice accounting (BIRD difficulty: simple/moderate/challenging; source:
+        # bird vs spider) so regressions on a slice are visible, not averaged away.
+        slice_totals: dict[str, int] = {}
+        slice_hits: dict[str, int] = {}
+
+        def _bump(group: str, key: str, hit: bool) -> None:
+            totals = slice_totals.setdefault(f"{group}:{key}", 0)
+            slice_totals[f"{group}:{key}"] = totals + 1
+            if hit:
+                slice_hits[f"{group}:{key}"] = slice_hits.get(f"{group}:{key}", 0) + 1
 
         t_wall_start = time.perf_counter()
         for rec in records:
@@ -189,6 +214,8 @@ class NL2SQLEvaluator:
                 exec_ok += 1
 
             correct = bool(g_ok and p_ok and g_rows is not None and p_rows is not None and results_equivalent(rec.sql, g_rows, p_rows))
+            _bump("difficulty", rec.difficulty or "unknown", correct)
+            _bump("source", rec.source or "unknown", correct)
             verifier_scores.append(conf)
             verifier_labels.append(1 if correct else 0)
             if correct:
@@ -211,6 +238,17 @@ class NL2SQLEvaluator:
         if len(set(verifier_labels)) == 2:
             auroc = round(float(roc_auc_score(verifier_labels, verifier_scores)), 4)
 
+        def _group_breakdown(group: str) -> dict[str, dict[str, float]]:
+            out: dict[str, dict[str, float]] = {}
+            for key in sorted({k.split(":", 1)[1] for k in slice_totals if k.startswith(f"{group}:")}):
+                total = slice_totals.get(f"{group}:{key}", 0)
+                hits = slice_hits.get(f"{group}:{key}", 0)
+                out[key] = {
+                    "total": total,
+                    "execution_accuracy": round(hits / max(total, 1), 4),
+                }
+            return out
+
         return EvalMetrics(
             dataset_name=dataset_name,
             total_examples=len(records),
@@ -225,5 +263,7 @@ class NL2SQLEvaluator:
             abstention_rate=round(abstained / total, 4),
             selective_execution_accuracy=round(non_abstained_hits / answered, 4),
             verifier_auroc=auroc,
+            by_difficulty=_group_breakdown("difficulty"),
+            by_source=_group_breakdown("source"),
             resource_stats=get_resource_stats(),
         )
