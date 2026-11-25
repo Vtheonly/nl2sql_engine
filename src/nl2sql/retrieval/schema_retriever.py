@@ -7,7 +7,9 @@ import numpy as np
 import torch
 from pydantic import BaseModel, Field
 from rank_bm25 import BM25Okapi
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel
+
+from nl2sql.utils.hf_compat import load_tokenizer
 
 from nl2sql.db.introspect import SchemaBundle, TableInfo
 from nl2sql.db.value_index import ValueIndex, ValueMatch
@@ -29,7 +31,7 @@ class DenseTableEncoder:
 
     def __init__(self, model_id_or_path: str = "BAAI/bge-small-en-v1.5", device: Optional[str] = None) -> None:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id_or_path)
+        self.tokenizer = load_tokenizer(model_id_or_path)
         self.model = AutoModel.from_pretrained(model_id_or_path).to(self.device).eval()
         # Read the real hidden size so the empty-batch placeholder matches the model's
         # output dimension even when a non-384-dim encoder is configured.

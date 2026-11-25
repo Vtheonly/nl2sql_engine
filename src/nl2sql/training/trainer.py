@@ -8,7 +8,9 @@ from typing import Any, Optional
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from transformers import AutoModel, AutoTokenizer, get_cosine_schedule_with_warmup
+from transformers import AutoModel, get_cosine_schedule_with_warmup
+
+from nl2sql.utils.hf_compat import load_tokenizer
 
 from nl2sql.compiler.sql_compiler import SQLSecurityError, compile_and_validate_sql
 from nl2sql.config import EngineConfig
@@ -281,7 +283,7 @@ class NL2SQLTrainer:
 
     def train_embedder(self, train_records: list[ExampleRecord], val_records: list[ExampleRecord], caches: dict[str, tuple[SchemaBundle, ValueIndex]]) -> dict[str, Any]:
         model_id = self.cfg.models.embedder_model_id
-        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        tokenizer = load_tokenizer(model_id)
         encoder = AutoModel.from_pretrained(model_id)
         train_ds = EmbedderDataset(train_records, caches)
         val_ds = EmbedderDataset(val_records, caches) if val_records else None

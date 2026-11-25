@@ -1112,3 +1112,106 @@ def test_train_verifier_calibrates_and_saves_best_epoch_weights(
     assert isinstance(meta["temperature"], float)
     reloaded = ModernBertVerifier.from_pretrained_dir(verifier_dir)
     assert abs(float(reloaded.temperature.item()) - meta["temperature"]) < 1e-6
+
+
+# ----------------------------------------------------------------------------
+# Round 3: transformers 5.2x added_tokens_decoder binding regression.
+#
+# Salesforce/codet5p-220m ships only slow tokenizer files; transformers 5.2x
+# auto-converts to fast and passes the converted sentinel tokens as plain
+# dicts into the Rust `tokenizers` binding, which rejects them with
+# "TypeError: Input must be a List[Union[str, AddedToken]]" during
+# AutoTokenizer.from_pretrained. nl2sql.utils.hf_compat.load_tokenizer catches
+# exactly that failure and retries with a sanitized added_tokens_decoder.
+# ----------------------------------------------------------------------------
+
+
+def test_load_tokenizer_retries_on_binding_typeerror(monkeypatch, tmp_path, tiny_modernbert_dir):
+    from transformers import AddedToken, AutoTokenizer
+
+    from nl2sql.utils.hf_compat import load_tokenizer
+
+    local_dir = tmp_path / "tokdir"
+    local_dir.mkdir()
+    for f in tiny_modernbert_dir.iterdir():
+        if f.is_file():
+            (local_dir / f.name).write_bytes(f.read_bytes())
+
+    calls: list[dict] = []
+    real = AutoTokenizer.from_pretrained
+
+    def fake_from_pretrained(model_id, **kw):
+        calls.append(dict(kw))
+        if "added_tokens_decoder" not in kw:
+            raise TypeError("Input must be a List[Union[str, AddedToken]]")
+        return real(model_id, **kw)
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", staticmethod(fake_from_pretrained))
+
+    tok = load_tokenizer(str(local_dir))
+
+    assert len(calls) == 2, "expected exactly one retry"
+    decoder = calls[1]["added_tokens_decoder"]
+    assert isinstance(decoder, dict)
+    assert all(isinstance(v, (AddedToken, str)) for v in decoder.values())
+    assert tok is not None and tok("SELECT 1") is not None
+
+
+def test_load_tokenizer_converts_decoder_dict_entries(monkeypatch, tmp_path, tiny_modernbert_dir):
+    """A local tokenizer_config.json with dict decoder entries gets converted to AddedToken on retry."""
+    import shutil
+
+    from transformers import AddedToken, AutoTokenizer
+
+    from nl2sql.utils.hf_compat import load_tokenizer
+
+    local_dir = tmp_path / "tokdir"
+    shutil.copytree(tiny_modernbert_dir, local_dir)
+    cfg_path = local_dir / "tokenizer_config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["added_tokens_decoder"] = {
+        "100": {"content": "[TBL]", "single_word": False, "lstrip": True, "rstrip": False, "normalized": True},
+        "101": {"content": "[COL]", "single_word": False, "lstrip": False, "rstrip": False, "normalized": False},
+    }
+    cfg_path.write_text(json.dumps(cfg))
+
+    captured: dict = {}
+    real = AutoTokenizer.from_pretrained
+
+    def fake_from_pretrained(model_id, **kw):
+        if "added_tokens_decoder" not in kw:
+            raise TypeError("Input must be a List[Union[str, AddedToken]]")
+        captured.update(kw)
+        return real(model_id, **kw)
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", staticmethod(fake_from_pretrained))
+
+    load_tokenizer(str(local_dir))
+
+    decoder = captured["added_tokens_decoder"]
+    assert set(decoder.keys()) == {100, 101}
+    assert all(isinstance(v, AddedToken) for v in decoder.values())
+    contents = {v.content for v in decoder.values()}
+    assert contents == {"[TBL]", "[COL]"}
+    tbl = decoder[100]
+    assert tbl.lstrip is True and tbl.special is True
+
+
+def test_load_tokenizer_passes_through_unrelated_errors(monkeypatch, tmp_path, tiny_modernbert_dir):
+    """Only the specific binding TypeError triggers a retry; other TypeErrors propagate."""
+    import shutil
+
+    from transformers import AutoTokenizer
+
+    from nl2sql.utils.hf_compat import load_tokenizer
+
+    local_dir = tmp_path / "tokdir"
+    shutil.copytree(tiny_modernbert_dir, local_dir)
+
+    def fake_from_pretrained(model_id, **kw):
+        raise TypeError("some unrelated type error")
+
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", staticmethod(fake_from_pretrained))
+
+    with pytest.raises(TypeError, match="some unrelated"):
+        load_tokenizer(str(local_dir))

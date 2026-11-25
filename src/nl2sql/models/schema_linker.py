@@ -6,9 +6,10 @@ from typing import Any, Optional
 
 import torch
 import torch.nn as nn
-from transformers import AutoConfig, AutoModel, AutoTokenizer
+from transformers import AutoConfig, AutoModel
 
 from nl2sql.db.introspect import SchemaBundle, TableInfo
+from nl2sql.utils.hf_compat import load_tokenizer
 from nl2sql.db.value_index import ValueMatch
 
 
@@ -29,7 +30,7 @@ class ModernBertSchemaLinker(nn.Module):
 
     def __init__(self, model_id_or_path: str = "answerdotai/ModernBERT-base", pos_weight: float = 3.0) -> None:
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id_or_path)
+        self.tokenizer = load_tokenizer(model_id_or_path)
         self.encoder = _load_backbone(model_id_or_path)
         added = self.tokenizer.add_special_tokens({"additional_special_tokens": [self.TBL_TOKEN, self.COL_TOKEN]})
         if added > 0:

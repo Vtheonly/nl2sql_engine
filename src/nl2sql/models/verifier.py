@@ -6,9 +6,9 @@ from typing import Any, Optional
 
 import torch
 import torch.nn as nn
-from transformers import AutoTokenizer
 
 from nl2sql.models.schema_linker import _load_backbone
+from nl2sql.utils.hf_compat import load_tokenizer
 
 
 class ModernBertVerifier(nn.Module):
@@ -16,7 +16,7 @@ class ModernBertVerifier(nn.Module):
 
     def __init__(self, model_id_or_path: str = "answerdotai/ModernBERT-base") -> None:
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id_or_path)
+        self.tokenizer = load_tokenizer(model_id_or_path)
         self.encoder = _load_backbone(model_id_or_path)
         hidden = self.encoder.config.hidden_size
         self.classifier = nn.Sequential(nn.Dropout(0.1), nn.Linear(hidden, 1))

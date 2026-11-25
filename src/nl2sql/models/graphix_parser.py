@@ -7,7 +7,9 @@ from typing import Any, Optional
 
 import torch
 import torch.nn as nn
-from transformers import AutoTokenizer, LogitsProcessor, T5ForConditionalGeneration
+from transformers import LogitsProcessor, T5ForConditionalGeneration
+
+from nl2sql.utils.hf_compat import load_tokenizer
 
 from nl2sql.db.introspect import SchemaBundle, TableInfo
 from nl2sql.db.value_index import ValueMatch
@@ -259,7 +261,7 @@ class GraphixCodeT5Parser(nn.Module):
 
     def __init__(self, model_id_or_path: str = "Salesforce/codet5p-220m") -> None:
         super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id_or_path)
+        self.tokenizer = load_tokenizer(model_id_or_path)
         self.model = T5ForConditionalGeneration.from_pretrained(model_id_or_path)
         added = self.tokenizer.add_special_tokens(
             {"additional_special_tokens": [TBL_TOKEN, COL_TOKEN, "[PK]", "[FK]", "[VAL]", SCHEMA_TOKEN]}
