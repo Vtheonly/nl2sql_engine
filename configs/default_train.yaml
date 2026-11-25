@@ -1,0 +1,57 @@
+project_name: nl2sql-engine
+work_dir: ./workspace
+seed: 42
+
+data:
+  data_dir: ./workspace/data
+  use_bird: true
+  use_bird_filtered_train: true
+  use_spider: false
+  spider_db_zip: null
+  spider_db_url: null
+  val_ratio_by_db: 0.15
+  schema_perturbation_prob: 0.35
+  max_distinct_values_per_col: 10000
+  timeout_sec: 120
+
+models:
+  embedder_model_id: BAAI/bge-small-en-v1.5
+  linker_model_id: answerdotai/ModernBERT-base
+  parser_model_id: Salesforce/codet5p-220m
+  verifier_model_id: answerdotai/ModernBERT-base
+  linker_max_length: 4096
+  parser_max_source_length: 1024
+  parser_max_target_length: 192
+  verifier_max_length: 1024
+  linker_recall_pos_weight: 3.0
+  linker_threshold: 0.30
+  num_return_candidates: 4
+  use_xgrammar: true
+  abstention_threshold: 0.45
+  abstention_margin: 0.05
+
+training:
+  stage: parser # embedder | linker | parser | verifier | all
+  output_dir: ./workspace/runs/exp01
+  epochs: 5
+  batch_size: 8
+  grad_accum_steps: 4
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.06
+  max_grad_norm: 1.0
+  mixed_precision: bf16 # no | fp16 | bf16
+  eval_every_epochs: 1
+  save_every_steps: 250
+  keep_last_k_checkpoints: 3
+  early_stopping_patience: 3
+  resume_from: auto # null | auto | explicit path
+  num_workers: 2
+
+hub:
+  enabled: false
+  repo_id: null
+  private: true
+  push_checkpoints: false
+  push_final_models: true
+  push_eval_reports: true
