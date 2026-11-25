@@ -24,7 +24,6 @@ import pytest
 import torch
 
 from nl2sql.compiler.sql_compiler import compile_and_validate_sql
-from nl2sql.config import DataConfig, EngineConfig, HubConfig, ModelConfig, TrainingConfig
 from nl2sql.datasets.acquire import DatasetAcquisitionResult
 from nl2sql.datasets.prepare import (
     ExampleRecord,
@@ -36,7 +35,7 @@ from nl2sql.datasets.prepare import (
 )
 from nl2sql.db.introspect import JoinEdge, SchemaBundle, TableInfo, ColumnInfo, compute_ddl_hash, introspect_database
 from nl2sql.db.value_index import ValueIndex
-from nl2sql.engine import NL2SQLEngine, QueryRequest, create_app
+from nl2sql.engine import NL2SQLEngine, create_app
 from nl2sql.evaluation.evaluator import execute_sqlite_readonly, results_equivalent, NL2SQLEvaluator
 from nl2sql.models.graphix_parser import (
     REL_FK_EDGE,
@@ -46,7 +45,6 @@ from nl2sql.models.graphix_parser import (
     Seq2SeqXGrammarLogitsProcessor,
     build_sqlite_schema_ebnf,
 )
-from nl2sql.models.schema_linker import ModernBertSchemaLinker
 from nl2sql.retrieval.schema_retriever import HybridSchemaRetriever
 
 from conftest import SHOP_DDL, WAREHOUSE_DDL, create_sqlite, make_engine_config
@@ -276,8 +274,6 @@ def test_ebnf_supports_cast_quoted_ids_and_qualified_star():
 )
 def test_ebnf_grounding_decisions(shop_bundle, sql, expected):
     ebnf = build_sqlite_schema_ebnf(shop_bundle.tables, [])
-    # The grounded alternatives literally contain every allowed column spelling.
-    grounded = sql.replace("SELECT ", "").split(" FROM ")[0]
     if expected:
         # At minimum the grammar must reference each identifier used.
         for ident in ("customers", "orders", "tickets", "name", "id", "status"):
@@ -306,13 +302,17 @@ def test_greedy_candidate_zero_is_deterministic(tiny_t5_dir, shop_bundle):
 
 @pytest.fixture()
 def fanout_db(tmp_path: Path):
+    # Alice carries 2 orders AND 2 tickets: joining both children multiplies every
+    # child row by its sibling's cardinality (4 joined rows), so a plain
+    # SUM/COUNT over the join double-counts -- exactly the trap the CTE
+    # pre-aggregation rewrite exists to eliminate.
     ddl = """
     CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT);
     CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL);
     CREATE TABLE tickets (id INTEGER PRIMARY KEY, customer_id INTEGER, status TEXT);
-    INSERT INTO customers VALUES (1,'Alice'),(2,'Bob');
-    INSERT INTO orders VALUES (10,1,5.0),(11,2,6.0);
-    INSERT INTO tickets VALUES (100,1,'open'),(101,2,'closed');
+    INSERT INTO customers VALUES (1,'Alice'),(2,'Bob'),(3,'Cara');
+    INSERT INTO orders VALUES (10,1,5.0),(12,1,7.0),(11,2,6.0);
+    INSERT INTO tickets VALUES (100,1,'open'),(102,1,'closed'),(101,2,'closed');
     """
     p = create_sqlite(tmp_path / "fanout.sqlite", ddl)
     return p, introspect_database(f"sqlite:///{p.resolve()}", db_id="fanout")
@@ -333,7 +333,7 @@ def test_join_synthesis_uses_query_aliases(fanout_db):
 
 
 def test_fanout_detection_excludes_invariant_aggregates(fanout_db):
-    _, bundle = fanout_db
+    db_path, bundle = fanout_db
     for sql in [
         "SELECT c.name, MIN(o.amount), MAX(t.id) FROM customers c JOIN orders o ON c.id=o.customer_id JOIN tickets t ON c.id=t.customer_id GROUP BY c.name",
         "SELECT c.name, COUNT(DISTINCT o.id), COUNT(DISTINCT t.id) FROM customers c JOIN orders o ON c.id=o.customer_id JOIN tickets t ON c.id=t.customer_id GROUP BY c.name",
@@ -341,12 +341,31 @@ def test_fanout_detection_excludes_invariant_aggregates(fanout_db):
     ]:
         res = compile_and_validate_sql(sql, bundle, default_limit=0)
         assert res.ambiguity_flags == [], f"safe query falsely flagged: {sql[:60]}"
-    # Genuine fan-out (plain SUM + COUNT over two N:1 children) is still flagged,
-    # including through table aliases.
+    # Genuine fan-out (plain SUM + COUNT over two N:1 children) is now auto-
+    # rewritten into CTE pre-aggregation: no ambiguity flag, and the executed
+    # result matches the fan-out-free ground truth (no multiplied counts/sums).
     risky = "SELECT c.name, SUM(o.amount), COUNT(t.id) FROM customers c JOIN orders o ON c.id=o.customer_id JOIN tickets t ON c.id=t.customer_id GROUP BY c.name"
     res = compile_and_validate_sql(risky, bundle, default_limit=0)
-    assert any("fan-out" in f.lower() for f in res.ambiguity_flags)
-    assert res.fanout_warnings, "fan-out warning list renamed but must stay populated"
+    assert "WITH" in res.sql.upper() and "__preagg_" in res.sql.lower()
+    assert res.ambiguity_flags == []
+    assert any("cte pre-aggregation" in w.lower() for w in res.fanout_warnings)
+    ok, rows, _, msg = execute_sqlite_readonly(db_path, res.sql)
+    assert ok, f"rewritten fan-out SQL failed: {msg}"
+    by_name = {r[0]: (r[1], r[2]) for r in rows}
+    # Alice: 2 orders (5+7) joined to 2 tickets -- naive join multiplies to
+    # SUM=24 / COUNT=4; the rewrite must return the per-parent truth.
+    assert by_name["Alice"] == (12.0, 2)
+    assert by_name["Bob"] == (6.0, 1)
+    assert by_name["Cara"] == (None, 0)  # childless parent: COUNT 0, SUM NULL
+    # A query the rewrite cannot safely lower (child column inside GROUP BY)
+    # keeps the warning + abstention path.
+    unrewritable = (
+        "SELECT c.name, o.status, SUM(o.amount), COUNT(t.id) FROM customers c "
+        "JOIN orders o ON c.id=o.customer_id JOIN tickets t ON c.id=t.customer_id "
+        "GROUP BY c.name, o.status"
+    )
+    res2 = compile_and_validate_sql(unrewritable, bundle, default_limit=0)
+    assert res2.ambiguity_flags and "WITH" not in res2.sql.upper()
 
 
 def test_engine_evaluation_does_not_inject_limit(tmp_path, engine_config, shop_db, shop_bundle, monkeypatch):
@@ -398,7 +417,8 @@ def _acq_from_rows(tmp_path: Path, rows: list[dict]) -> DatasetAcquisitionResult
 
 
 def test_prepare_records_drops_empty_gold_tables(tmp_path: Path):
-    db = create_sqlite(tmp_path / "dbs" / "shop" / "shop.sqlite", SHOP_DDL)
+    # The SQLite file only needs to exist for build_db_caches introspection.
+    create_sqlite(tmp_path / "dbs" / "shop" / "shop.sqlite", SHOP_DDL)
     rows = [
         {"id": "ok", "source": "bird_train", "db_id": "shop", "question": "q1", "evidence": "", "sql": "SELECT COUNT(*) FROM tickets"},
         {"id": "bad", "source": "bird_train", "db_id": "shop", "question": "q2", "evidence": "", "sql": "SELECT ??? FROM"},
@@ -728,16 +748,19 @@ def _mixed_case_bundle() -> SchemaBundle:
 
 def test_fanout_detection_flags_mixed_case_tables():
     # Identical query spelled with mixed-case table names (common in BIRD) must be
-    # flagged exactly like its lowercase twin: canonical names are lowercased when
-    # resolving join-edge parents.
+    # rewritten exactly like its lowercase twin: canonical names are lowercased
+    # when resolving join-edge parents, and the CTE rewrite emits the same
+    # pre-aggregation structure.
     bundle = _mixed_case_bundle()
     sql = (
         "SELECT c.Name, SUM(o.Amount), COUNT(t.Id) FROM Customers c "
         "JOIN Orders o ON c.Id = o.CustomerId JOIN Tickets t ON c.Id = t.CustomerId GROUP BY c.Name"
     )
     res = compile_and_validate_sql(sql, bundle, default_limit=0)
-    assert res.fanout_warnings, "mixed-case spelling silently skipped fan-out detection"
-    assert any("fan-out" in f.lower() for f in res.ambiguity_flags)
+    assert "WITH" in res.sql.upper() and "__preagg_" in res.sql.lower()
+    assert res.ambiguity_flags == []
+    assert res.fanout_warnings, "mixed-case spelling silently skipped fan-out rewriting"
+    assert any("cte pre-aggregation" in w.lower() for w in res.fanout_warnings)
 
 
 def test_fanout_alias_resolution_is_per_select_not_global():

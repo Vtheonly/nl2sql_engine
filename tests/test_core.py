@@ -55,13 +55,18 @@ def test_sqlglot_compiler_join_synthesis_fanout_and_security(tmp_path: Path) -> 
     assert "ON" in res.sql.upper()
     assert len(res.join_repairs) == 1
 
-    # 2. Diverging 1:N tables aggregated together flagged for fan-out protection
+    # 2. Diverging 1:N tables aggregated together: auto CTE pre-aggregation now
+    # REWRITES the query (per-parent pre-aggregated CTEs + LEFT JOINs) instead of
+    # only flagging it: the ambiguity flag disappears and the warning records the
+    # rewrite, so the engine no longer abstains on a provably fixable query.
     fan = compile_and_validate_sql(
         "SELECT c.name, SUM(orders.amount), COUNT(tickets.id) FROM customers c "
         "JOIN orders ON c.id = orders.customer_id JOIN tickets ON c.id = tickets.customer_id GROUP BY c.name",
         bundle,
     )
-    assert any("fan-out" in f.lower() for f in fan.ambiguity_flags)
+    assert "WITH" in fan.sql.upper() and "__preagg_" in fan.sql.lower()
+    assert fan.ambiguity_flags == []
+    assert any("cte pre-aggregation" in w.lower() for w in fan.fanout_warnings)
 
     # 3. DML / RBAC blocked deterministically
     with pytest.raises(SQLSecurityError):

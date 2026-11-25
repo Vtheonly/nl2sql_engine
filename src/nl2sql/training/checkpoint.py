@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -9,6 +10,8 @@ from typing import Any, Optional
 import torch
 
 from nl2sql.utils.repro import capture_rng_state, restore_rng_state
+
+logger = logging.getLogger(__name__)
 
 
 class CheckpointManager:
@@ -34,7 +37,15 @@ class CheckpointManager:
         metrics_history: list[dict[str, Any]],
         is_best: bool = False,
         patience_left: Optional[int] = None,
+        batch_idx_in_epoch: int = 0,
     ) -> Path:
+        """Persist resumable trainer state.
+
+        ``epoch`` is the epoch to run NEXT (end-of-epoch saves pass ``epoch + 1``);
+        mid-epoch saves pass the CURRENT epoch together with ``batch_idx_in_epoch``
+        = the number of batches of that epoch already processed, so resume can
+        fast-forward to the exact interruption point via ``itertools.islice``.
+        """
         step_dir = self.ckpt_root / stage / f"step_{global_step:07d}"
         tmp_dir = self.ckpt_root / stage / f".tmp_step_{global_step:07d}"
         if tmp_dir.exists():
@@ -44,6 +55,7 @@ class CheckpointManager:
         payload = {
             "stage": stage,
             "epoch": epoch,
+            "batch_idx_in_epoch": int(batch_idx_in_epoch),
             "global_step": global_step,
             "best_metric": best_metric,
             "patience_left": patience_left,
@@ -59,7 +71,8 @@ class CheckpointManager:
         (tmp_dir / "meta.json").write_text(
             json.dumps(
                 {
-                    "stage": stage, "epoch": epoch, "global_step": global_step,
+                    "stage": stage, "epoch": epoch, "batch_idx_in_epoch": int(batch_idx_in_epoch),
+                    "global_step": global_step,
                     "best_metric": best_metric, "patience_left": patience_left,
                 },
                 indent=2,
@@ -103,7 +116,25 @@ class CheckpointManager:
                     return p
             return None
         p = Path(resume_from)
-        return p if (p / "trainer_state.pt").exists() else None
+        if not (p / "trainer_state.pt").exists():
+            return None
+        # An explicit path may belong to a DIFFERENT stage (copied directory, wrong
+        # hand-written path): loading it would silently graft the parser's optimizer
+        # state onto the verifier. meta.json records the stage without a torch.load.
+        meta_path = p / "meta.json"
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning("Could not read checkpoint meta at %s (%s); refusing to resume.", p, exc)
+                return None
+            if meta.get("stage") != stage:
+                logger.warning(
+                    "Checkpoint %s belongs to stage '%s', not '%s'; refusing cross-stage resume.",
+                    p, meta.get("stage"), stage,
+                )
+                return None
+        return p
 
     def load(
         self,

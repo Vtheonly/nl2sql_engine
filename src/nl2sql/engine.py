@@ -10,6 +10,7 @@ from typing import Any, Optional
 import torch
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 
 from nl2sql.compiler.sql_compiler import SQLSecurityError, compile_and_validate_sql
@@ -57,6 +58,9 @@ class RegisterRequest(BaseModel):
     cache_dir: Optional[str] = None
     column_meanings: Optional[dict[str, str]] = None
     example_queries: Optional[list[dict[str, str]]] = None
+    # StructCBR semantic layer: historical SQL whose observed joins become
+    # query_log JoinEdges and whose deduplicated shapes become example hints.
+    query_log_sql: Optional[list[str]] = None
 
 
 class QueryResponse(BaseModel):
@@ -101,6 +105,11 @@ class NL2SQLEngine:
         )
 
         self.db_registry: dict[str, tuple[SchemaBundle, ValueIndex, Optional[Path]]] = {}
+        # Non-SQLite connection URLs, for the multi-dialect EXPLAIN dry-run layer.
+        # Kept beside (not inside) the registry tuple so existing callers that
+        # assign 3-tuples directly keep working.
+        self._conn_urls: dict[str, str] = {}
+        self._explain_engines: dict[str, Any] = {}
         # (db_id, question skeleton, evidence, dialect, allowed-tables signature,
         #  limit guardrail) -> SQL. Bounded LRU: entries are evicted oldest-first once
         # the cap is reached.
@@ -132,6 +141,7 @@ class NL2SQLEngine:
         sqlite_path: Optional[Path] = None,
         column_meanings: Optional[dict[str, str]] = None,
         example_queries: Optional[list[dict[str, str]]] = None,
+        query_log_sql: Optional[list[str]] = None,
     ) -> SchemaBundle:
         cdir = Path(cache_dir) / db_id
         bpath = cdir / "schema_bundle.json"
@@ -161,10 +171,19 @@ class NL2SQLEngine:
         if example_queries:
             bundle.example_queries = list(example_queries)
             bundle.save(bpath)
+        # Historical query-log mining: observed joins the schema lacks become
+        # query_log edges; representative shapes become example hints.
+        if query_log_sql:
+            from nl2sql.db.query_log_miner import enrich_bundle_from_logs
+
+            added = enrich_bundle_from_logs(bundle, list(query_log_sql))
+            if added:
+                logger.info("Mined %d join edge(s) for '%s' from the query log.", added, db_id)
+                bundle.save(bpath)
 
         # Layer 6 dry-run execution needs the SQLite file. Derive it from the
         # connection URL so callers don't have to pass it redundantly; non-SQLite
-        # dialects keep dry-run disabled (no EXPLAIN path implemented) and warn once.
+        # dialects fall back to the multi-dialect EXPLAIN dry-run layer.
         if sqlite_path is None:
             try:
                 url = make_url(connection_url)
@@ -173,13 +192,55 @@ class NL2SQLEngine:
             except Exception:
                 sqlite_path = None
         if sqlite_path is None:
-            logger.info("No SQLite path for '%s'; Layer 6 dry-run execution disabled.", db_id)
+            logger.info("No SQLite path for '%s'; Layer 6 dry-run uses EXPLAIN validation.", db_id)
 
         v_idx = ValueIndex(cdir / "value_index.sqlite")
         if not v_idx.is_built_for(bundle.ddl_hash):
-            v_idx.build_from_db(connection_url, bundle, max_distinct_per_col=self.cfg.data.max_distinct_values_per_col)
+            v_idx.build_from_db(
+                connection_url,
+                bundle,
+                max_distinct_per_col=self.cfg.data.max_distinct_values_per_col,
+                low_cardinality_max_distinct=self.cfg.data.low_cardinality_max_distinct,
+            )
         self.db_registry[db_id] = (bundle, v_idx, sqlite_path)
+        self._conn_urls[db_id] = connection_url
+        self._explain_engines.pop(db_id, None)
         return bundle
+
+    def _explain_dry_run(self, db_id: str, sql: str) -> tuple[bool, str]:
+        """Validate a candidate SQL via EXPLAIN on registered non-SQLite dialects.
+
+        SQLite databases with a file path get real read-only execution (rows +
+        timing) in ``answer()``; every other registration previously validated
+        nothing ("ast_valid") -- a syntactically parseable but schema-invalid
+        statement sailed through to the caller. The EXPLAIN now runs inside a
+        transaction that is ALWAYS rolled back, so the plan query can never
+        leave state behind on the target database. Prefixes cover PostgreSQL,
+        MySQL, DuckDB and SQLite alike (the dialect of the cached engine
+        decides).
+        """
+        url = self._conn_urls.get(db_id)
+        if url is None:
+            return True, "ast_valid"
+        engine_cached = self._explain_engines.get(db_id)
+        if engine_cached is None:
+            try:
+                engine_cached = create_engine(url)
+            except Exception as exc:
+                logger.warning("Could not open engine for '%s' EXPLAIN dry-run (%s).", db_id, exc)
+                return True, "ast_valid"
+            self._explain_engines[db_id] = engine_cached
+        prefix = "EXPLAIN "
+        try:
+            with engine_cached.connect() as conn:
+                trans = conn.begin()
+                try:
+                    conn.execute(text(prefix + sql))
+                finally:
+                    trans.rollback()
+            return True, "explain_ok"
+        except Exception as exc:
+            return False, f"err={str(exc)[:120]}"
 
     @staticmethod
     def _resolve_device(device: Optional[str], cfg_device: Optional[str] = None) -> str:
@@ -235,6 +296,16 @@ class NL2SQLEngine:
         # tables (>1k tokens) raw into the parser.
         ret = self.retriever.retrieve(norm_q, bundle, v_idx)
         cand_tables = [t for t in ret.candidate_tables if allowed_set is None or t.name.lower() in allowed_set]
+        if not cand_tables:
+            # An allowlist that excludes every retrieved table used to degrade into
+            # the generic "No safe/valid SQL candidate compiled." abstention; an
+            # explicit RBAC reason is debuggable.
+            return QueryResponse(
+                db_id=db_id, abstained=True,
+                reason="RBAC allowlist excluded every retrieved table for this database.",
+                confidence=0.0, linked_tables=[],
+                latency_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+            )
         # RBAC must gate grounded literals too: un-filtered value_matches would leak
         # forbidden columns and their cell values (salaries.bonus = '50000') into the
         # parser prompt and the XGrammar literal grounding despite the table filter.
@@ -315,6 +386,11 @@ class NL2SQLEngine:
             if sqlite_path is not None:
                 ok, rows, _, msg = execute_sqlite_readonly(sqlite_path, comp.sql)
                 summary = f"ok rows={len(rows)}" if ok and rows is not None else f"err={msg[:60]}"
+            elif db_id in self._conn_urls:
+                # Non-SQLite dialect: EXPLAIN-only validation inside a rolled-back
+                # transaction (no row materialization, no side effects).
+                ok, summary = self._explain_dry_run(db_id, comp.sql)
+                rows = None
             else:
                 ok, rows, summary = True, None, "ast_valid"
             compiled_cands.append((comp, ok, rows, summary))
@@ -399,6 +475,7 @@ def create_app(engine: NL2SQLEngine) -> FastAPI:
                 cache_dir=cache_dir,
                 column_meanings=req.column_meanings,
                 example_queries=req.example_queries,
+                query_log_sql=req.query_log_sql,
             )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Database registration failed: {exc}") from exc

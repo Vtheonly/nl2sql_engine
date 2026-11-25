@@ -91,9 +91,17 @@ def _is_type_compatible(t1: str, t2: str) -> bool:
     return s1.split("(")[0].strip() == s2.split("(")[0].strip()
 
 
-def _infer_edge_cardinality(left_col: ColumnInfo, right_col: ColumnInfo) -> Literal["1:1", "N:1", "1:N", "M:N"]:
-    left_unique = left_col.is_pk or left_col.is_unique
-    right_unique = right_col.is_pk or right_col.is_unique
+def _infer_edge_cardinality(
+    left_col: ColumnInfo,
+    right_col: ColumnInfo,
+    left_pk_composite: bool = False,
+    right_pk_composite: bool = False,
+) -> Literal["1:1", "N:1", "1:N", "M:N"]:
+    # A composite-PK member is NOT individually unique: a (student_id, course_id)
+    # junction column repeats across rows, so treating every [PK] tag as unique
+    # produced phantom 1:1 edges (and wrong M:N junction cardinality).
+    left_unique = left_col.is_unique or (left_col.is_pk and not left_pk_composite)
+    right_unique = right_col.is_unique or (right_col.is_pk and not right_pk_composite)
     if left_unique and right_unique:
         return "1:1"
     if not left_unique and right_unique:
@@ -101,6 +109,19 @@ def _infer_edge_cardinality(left_col: ColumnInfo, right_col: ColumnInfo) -> Lite
     if left_unique and not right_unique:
         return "1:N"
     return "M:N"
+
+
+def _is_flag_column(col: ColumnInfo) -> bool:
+    """Boolean/flag columns are not foreign keys (is_paid, is_active, confirmed...).
+
+    Their low-cardinality 0/1 (or true/false) value domain satisfies almost any
+    inclusion probe against an integer key, so suffix+name matching alone
+    hallucinated FK edges like orders.is_paid -> payments.id.
+    """
+    dtype = col.data_type.lower()
+    if "bool" in dtype or "tinyint(1" in dtype.replace(" ", ""):
+        return True
+    return bool(re.match(r"^(is|has|can|was|flag)_", col.name.lower()))
 
 
 def _normalize_stem(name: str) -> str:
@@ -129,22 +150,50 @@ def _probe_inclusion(
             # Bound the un-indexed IN (SELECT ...) probe: on a 10M-row table a cold-start
             # introspection used to stall for minutes. SQLite progress handlers abort the
             # statement once the deadline passes; non-SQLite drivers fall back to running on.
-            raw = getattr(conn, "connection", None)
-            handler_set = False
-            if raw is not None and hasattr(raw, "set_progress_handler"):
-                deadline = time.perf_counter() + timeout_sec
-                raw.set_progress_handler(lambda: 1 if time.perf_counter() > deadline else 0, 10000)
-                handler_set = True
-            try:
-                row = conn.execute(sql, {"lim": sample_limit}).fetchone()
-            finally:
-                if handler_set:
-                    raw.set_progress_handler(None, 0)
-            if not row or not row[0] or row[0] == 0:
+            row = _bounded_fetchone(conn, sql, {"lim": sample_limit}, timeout_sec)
+            if not row or not row[0]:
                 return 0.0
             return float(row[1] or 0) / float(row[0])
     except Exception:
         return 0.0
+
+
+def _bounded_fetchone(conn, sql, params: dict, timeout_sec: float = 5.0):
+    """Fetch one row under a SQLite progress-handler deadline (None on abort/error).
+
+    Unbounded introspection queries (COUNT(*), DISTINCT samples) previously had
+    no deadline: a pathological table could stall database registration forever.
+    """
+    raw = getattr(conn, "connection", None)
+    handler_set = False
+    if raw is not None and hasattr(raw, "set_progress_handler"):
+        deadline = time.perf_counter() + timeout_sec
+        raw.set_progress_handler(lambda: 1 if time.perf_counter() > deadline else 0, 10000)
+        handler_set = True
+    try:
+        return conn.execute(sql, params).fetchone()
+    except Exception:
+        return None
+    finally:
+        if handler_set:
+            raw.set_progress_handler(None, 0)
+
+
+def _bounded_fetchall(conn, sql, params: dict, timeout_sec: float = 5.0):
+    """Fetch all rows under a SQLite progress-handler deadline ([] on abort/error)."""
+    raw = getattr(conn, "connection", None)
+    handler_set = False
+    if raw is not None and hasattr(raw, "set_progress_handler"):
+        deadline = time.perf_counter() + timeout_sec
+        raw.set_progress_handler(lambda: 1 if time.perf_counter() > deadline else 0, 10000)
+        handler_set = True
+    try:
+        return conn.execute(sql, params).fetchall()
+    except Exception:
+        return []
+    finally:
+        if handler_set:
+            raw.set_progress_handler(None, 0)
 
 
 def _ddl_hash_from_tables(tables: list[TableInfo]) -> str:
@@ -174,7 +223,9 @@ def compute_ddl_hash(connection_url: str) -> str:
                 ColumnInfo(
                     name=col["name"],
                     data_type=str(col["type"]),
-                    is_pk=(col["name"] in pk_cols and len(pk_cols) == 1),
+                    # Composite-PK members carry the [PK] tag too: the single-column
+                    # restriction silently dropped tags for junction tables.
+                    is_pk=(col["name"] in pk_cols),
                 )
                 for col in insp.get_columns(table_name)
             ]
@@ -221,11 +272,16 @@ def introspect_database(
     column_meanings = column_meanings or {}
 
     with engine.connect() as conn:
+        pk_composite: dict[str, bool] = {}
         for table_name in sorted(insp.get_table_names()):
             if table_name.startswith("sqlite_"):
                 continue
             pk_info = insp.get_pk_constraint(table_name) or {}
             pk_cols = set(pk_info.get("constrained_columns") or [])
+            # Composite-PK tables (classic M:N junctions) get all members tagged
+            # [PK]; cardinality inference below then knows each member is NOT
+            # individually unique.
+            pk_composite[table_name] = len(pk_cols) > 1
             unique_cols: set[str] = set()
             for uq in insp.get_unique_constraints(table_name) or []:
                 cols = uq.get("column_names") or []
@@ -243,10 +299,10 @@ def introspect_database(
                 pass
 
             qt = _quote_ident(engine, table_name)
-            try:
-                row_count = int(conn.execute(text(f"SELECT COUNT(*) FROM {qt}")).scalar() or 0)
-            except Exception:
-                row_count = 0
+            # COUNT(*) and DISTINCT probes are deadline-bounded: a pathological or
+            # locked table used to stall registration indefinitely.
+            row = _bounded_fetchone(conn, text(f"SELECT COUNT(*) FROM {qt}"), {})
+            row_count = int((row[0] if row else 0) or 0)
 
             col_infos: list[ColumnInfo] = []
             for col in insp.get_columns(table_name):
@@ -255,12 +311,13 @@ def introspect_database(
                 samples: list[str] = []
                 if sample_values_per_col > 0 and row_count > 0:
                     try:
-                        rows = conn.execute(
+                        rows = _bounded_fetchall(
+                            conn,
                             text(
                                 f"SELECT DISTINCT {qc} FROM {qt} WHERE {qc} IS NOT NULL LIMIT :lim"
                             ),
                             {"lim": sample_values_per_col},
-                        ).fetchall()
+                        )
                         samples = [str(r[0])[:64] for r in rows if r[0] is not None]
                     except Exception:
                         samples = []
@@ -273,7 +330,7 @@ def introspect_database(
                         name=cname,
                         data_type=str(col["type"]),
                         nullable=bool(col.get("nullable", True)),
-                        is_pk=(cname in pk_cols and len(pk_cols) == 1),
+                        is_pk=(cname in pk_cols),
                         is_unique=(cname in unique_cols),
                         comment=col.get("comment"),
                         business_description=biz_desc,
@@ -303,7 +360,11 @@ def introspect_database(
         c_l, c_r = t_l.get_column(lc), t_r.get_column(rc)
         if not c_l or not c_r:
             continue
-        card = _infer_edge_cardinality(c_l, c_r)
+        card = _infer_edge_cardinality(
+            c_l, c_r,
+            left_pk_composite=pk_composite.get(t_l.name, False),
+            right_pk_composite=pk_composite.get(t_r.name, False),
+        )
         sig = (t_l.name, c_l.name, t_r.name, c_r.name)
         if sig not in seen_pairs:
             seen_pairs.add(sig)
@@ -325,11 +386,15 @@ def introspect_database(
         ]
         # Suffixes shared by non-``_id`` foreign keys in real corpora (cds_code,
         # driverRef, symbol, zip...). Same-name pairs are always considered.
-        fk_suffixes = ("id", "_code", "code", "_ref", "ref", "key", "symbol", "name", "no")
+        fk_suffixes = ("id", "_code", "code", "_ref", "ref", "key", "symbol", "name", "no", "zip")
         for t_l in tables:
             if t_l.row_count == 0:
                 continue
             for c_l in t_l.columns:
+                if _is_flag_column(c_l):
+                    # Boolean/flag columns are never FKs: their 0/1 domain passes
+                    # almost any integer-key inclusion probe (false FK edges).
+                    continue
                 lname = c_l.name.lower()
                 if not (
                     lname.endswith(fk_suffixes)
@@ -361,7 +426,11 @@ def introspect_database(
                                 left_column=c_l.name,
                                 right_table=t_r.name,
                                 right_column=c_r.name,
-                                cardinality=_infer_edge_cardinality(c_l, c_r),
+                                cardinality=_infer_edge_cardinality(
+                                    c_l, c_r,
+                                    left_pk_composite=pk_composite.get(t_l.name, False),
+                                    right_pk_composite=pk_composite.get(t_r.name, False),
+                                ),
                                 source="inferred_fk",
                                 confidence=round(0.6 + 0.35 * ratio, 3),
                             )

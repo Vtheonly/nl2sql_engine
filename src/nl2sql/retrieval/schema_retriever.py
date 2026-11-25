@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
 from typing import Optional
 
 import numpy as np
@@ -51,12 +52,21 @@ class DenseTableEncoder:
         return np.vstack(vecs).astype(np.float32)
 
 
+# Long-lived servers registering many databases grew the per-bundle caches without
+# bound; a small LRU cap keeps memory flat while still covering live working sets.
+_TABLE_CACHE_MAX = 32
+
+
 class HybridSchemaRetriever:
     """Combines FTS5 cell probing, BM25, BGE-small dense vectors, and 1-hop Hypergraph expansion."""
 
     def __init__(self, embedder: Optional[DenseTableEncoder] = None) -> None:
         self.embedder = embedder
-        self._table_cache: dict[str, tuple[str, BM25Okapi, np.ndarray]] = {}
+        self._table_cache: "OrderedDict[str, tuple[str, BM25Okapi, np.ndarray]]" = OrderedDict()
+        # Column-level vectors per SchemaBundle, cached at ingestion time: they
+        # feed the linker's candidate features without re-encoding columns on
+        # every query.
+        self._col_vec_cache: "OrderedDict[str, tuple[str, np.ndarray, list[int]]]" = OrderedDict()
 
     def _build_table_docs(self, bundle: SchemaBundle) -> tuple[list[list[str]], list[str], list[list[str]]]:
         """Return (BM25 token docs, per-column docs, table-level fallback docs).
@@ -79,20 +89,25 @@ class HybridSchemaRetriever:
     def _get_indexes(self, bundle: SchemaBundle) -> tuple[BM25Okapi, np.ndarray]:
         cached = self._table_cache.get(bundle.db_id)
         if cached and cached[0] == bundle.ddl_hash:
+            self._table_cache.move_to_end(bundle.db_id)
             return cached[1], cached[2]
         tok_docs, str_docs, col_docs = self._build_table_docs(bundle)
         bm25 = BM25Okapi(tok_docs)
         if self.embedder is not None:
             flat_cols = [doc for cols in col_docs for doc in cols]
             col_vecs = self.embedder.encode(flat_cols) if flat_cols else np.zeros((0, self.embedder.hidden_size), dtype=np.float32)
+            offsets: list[int] = []
+            off = 0
+            for cols in col_docs:
+                offsets.append(off)
+                off += len(cols)
+            self._cache_column_vectors(bundle, col_vecs, offsets)
             # Max-pool column vectors per table: one strong column match is enough to
             # retrieve the table, regardless of how many columns it has.
             tbl_vecs = np.zeros((len(col_docs), col_vecs.shape[1]), dtype=np.float32)
-            offset = 0
             for i, cols in enumerate(col_docs):
                 if cols:
-                    tbl_vecs[i] = col_vecs[offset : offset + len(cols)].max(axis=0)
-                offset += len(cols)
+                    tbl_vecs[i] = col_vecs[offsets[i] : offsets[i] + len(cols)].max(axis=0)
             # Blend the pooled column vector with the table-level doc vector so the
             # table name/comment signal is not lost for tables with weak columns.
             doc_vecs = self.embedder.encode(str_docs)
@@ -102,7 +117,40 @@ class HybridSchemaRetriever:
         else:
             vecs = np.zeros((len(str_docs), 1), dtype=np.float32)
         self._table_cache[bundle.db_id] = (bundle.ddl_hash, bm25, vecs)
+        while len(self._table_cache) > _TABLE_CACHE_MAX:
+            self._table_cache.popitem(last=False)
         return bm25, vecs
+
+    def get_column_vectors(self, bundle: SchemaBundle) -> tuple[np.ndarray, list[int]]:
+        """Cached column-level vectors (shape: [total_columns, hidden]) and per-table offsets.
+
+        Encoded once per (db_id, ddl_hash) at ingestion time instead of per query:
+        wide schemas re-encoding hundreds of column strings on every retrieval
+        dominated the CPU latency budget.
+        """
+        cached = self._col_vec_cache.get(bundle.db_id)
+        if cached and cached[0] == bundle.ddl_hash:
+            self._col_vec_cache.move_to_end(bundle.db_id)
+            return cached[1], cached[2]
+        _, _, col_docs = self._build_table_docs(bundle)
+        if self.embedder is None:
+            col_vecs = np.zeros((0, 1), dtype=np.float32)
+            offsets = []
+        else:
+            flat_cols = [doc for cols in col_docs for doc in cols]
+            col_vecs = self.embedder.encode(flat_cols) if flat_cols else np.zeros((0, self.embedder.hidden_size), dtype=np.float32)
+            offsets = []
+            off = 0
+            for cols in col_docs:
+                offsets.append(off)
+                off += len(cols)
+        self._cache_column_vectors(bundle, col_vecs, offsets)
+        return col_vecs, offsets
+
+    def _cache_column_vectors(self, bundle: SchemaBundle, col_vecs: np.ndarray, offsets: list[int]) -> None:
+        self._col_vec_cache[bundle.db_id] = (bundle.ddl_hash, col_vecs, offsets)
+        while len(self._col_vec_cache) > _TABLE_CACHE_MAX:
+            self._col_vec_cache.popitem(last=False)
 
     def retrieve(
         self,

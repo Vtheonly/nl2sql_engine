@@ -11,7 +11,6 @@ import json
 import re
 from pathlib import Path
 
-import pytest
 
 NOTEBOOK = Path(__file__).resolve().parents[1] / "notebooks" / "train_nl2sql.ipynb"
 
@@ -91,7 +90,6 @@ def test_notebook_orchestrates_public_pipeline_interface(tmp_path: Path, monkeyp
     """Execute the notebook's code cells (minus the pip-install setup cell) against
     a stubbed pipeline, proving the cells drive the intended public API sequence."""
     import nl2sql.pipeline as pipeline_mod
-    from nl2sql.pipeline import NL2SQLPipeline
 
     nb = _load_notebook()
     code_cells = ["".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code"]

@@ -6,7 +6,6 @@ import threading
 from pathlib import Path
 
 import numpy as np
-import pytest
 import torch
 
 from nl2sql.db.introspect import ColumnInfo, JoinEdge, SchemaBundle, TableInfo

@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 import torch
 
-from nl2sql.config import EngineConfig
 from nl2sql.datasets.acquire import DatasetAcquisitionResult
 from nl2sql.datasets.prepare import (
     ExampleRecord,
@@ -236,9 +235,10 @@ def test_pipeline_end_to_end(
 ) -> None:
     # -- synthetic acquisition result standing in for the downloaded BIRD corpus --
     data_dir = tmp_path / "data"
-    db1 = create_sqlite(data_dir / "train_dbs" / "shop" / "shop.sqlite", SHOP_DDL)
-    db2 = create_sqlite(data_dir / "train_dbs" / "warehouse" / "warehouse.sqlite", WAREHOUSE_DDL)
-    db3 = create_sqlite(data_dir / "dev_dbs" / "dev_shop" / "dev_shop.sqlite", SHOP_DDL)
+    # The three SQLite files only need to exist for acquisition/introspection.
+    create_sqlite(data_dir / "train_dbs" / "shop" / "shop.sqlite", SHOP_DDL)
+    create_sqlite(data_dir / "train_dbs" / "warehouse" / "warehouse.sqlite", WAREHOUSE_DDL)
+    create_sqlite(data_dir / "dev_dbs" / "dev_shop" / "dev_shop.sqlite", SHOP_DDL)
 
     train_rows = [
         {"id": "t1", "source": "bird_train", "db_id": "shop", "question": "How many open tickets for Alice?", "evidence": "", "sql": "SELECT COUNT(*) FROM tickets WHERE status = 'open'"},

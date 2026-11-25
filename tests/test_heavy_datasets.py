@@ -5,8 +5,6 @@ config round-trips, and checkpoint manager edge cases."""
 from __future__ import annotations
 
 import json
-import re
-import zipfile
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -15,7 +13,7 @@ import threading
 import pytest
 import torch
 
-from nl2sql.config import DataConfig, EngineConfig, HubConfig, ModelConfig, TrainingConfig, load_config, save_config
+from nl2sql.config import DataConfig, EngineConfig, TrainingConfig, load_config, save_config
 from nl2sql.datasets.acquire import (
     DatasetAcquisitionResult,
     download_file_resumable,
@@ -31,12 +29,11 @@ from nl2sql.datasets.prepare import (
     perturb_schema_bundle,
     prepare_records,
 )
-from nl2sql.db.introspect import ColumnInfo, TableInfo
 from nl2sql.db.value_index import ValueIndex, ValueMatch
 from nl2sql.training.checkpoint import CheckpointManager
 from nl2sql.utils.repro import set_seed
 
-from conftest import SHOP_DDL, WAREHOUSE_DDL, create_sqlite
+from conftest import SHOP_DDL, create_sqlite
 
 
 class PlainHTTPHandler(SimpleHTTPRequestHandler):
@@ -123,7 +120,7 @@ class TestGoldExtraction:
 
 class TestPerturbation:
     def test_permutation_preserves_content(self, shop_bundle) -> None:
-        rng = torch.manual_seed(0)  # deterministic; use random.Random below
+        torch.manual_seed(0)  # deterministic; use random.Random below
         import random
 
         before_names = sorted(t.name for t in shop_bundle.tables)

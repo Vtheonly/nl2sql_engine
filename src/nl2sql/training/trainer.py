@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import math
 import random
 from pathlib import Path
@@ -34,6 +35,37 @@ from nl2sql.utils.logging import get_logger, get_resource_stats
 from nl2sql.utils.repro import set_seed
 
 logger = get_logger(__name__)
+
+
+def _build_wsd_scheduler(
+    optimizer: torch.optim.Optimizer,
+    total_steps: int,
+    warmup_steps: int,
+    decay_steps: int,
+    final_lr_ratio: float,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Warmup-Stable-Decay LR schedule (extension-proof).
+
+    Fixed-horizon cosine schedules hit ``lr = 0.0`` exactly at the planned horizon:
+    whenever training is later extended (more epochs, a fresh Colab account taking
+    over mid-run), the resumed optimizer sits at zero LR and learns nothing.
+    WSD instead decays only over the final ``decay_steps`` window and plateaus at
+    ``final_lr_ratio * peak`` afterwards, so any extension keeps a live LR.
+    """
+
+    def wsd_lambda(step: int) -> float:
+        if warmup_steps > 0 and step < warmup_steps:
+            return step / max(1, warmup_steps)
+        if step >= total_steps:
+            return final_lr_ratio
+        decay_start = max(warmup_steps, total_steps - decay_steps)
+        if step < decay_start:
+            return 1.0
+        span = max(1, total_steps - decay_start)
+        progress = (step - decay_start) / span
+        return final_lr_ratio + (1.0 - final_lr_ratio) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, wsd_lambda)
 
 
 class _EmbedderCollate:
@@ -155,12 +187,31 @@ class NL2SQLTrainer:
         return torch.float16
 
     def _loader(self, dataset: Any, collate: Any, batch_size: int, shuffle: bool) -> DataLoader:
+        # A seeded generator makes each epoch's shuffle reproducible from the run
+        # seed alone: the trainer reseeds it per epoch (seed + epoch) before
+        # iterating, which is what lets a mid-epoch resume replay the EXACT same
+        # batch order and fast-forward to the interruption point.
+        gen = torch.Generator() if shuffle else None
         return DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=shuffle,
             collate_fn=collate,
             num_workers=self.cfg.training.num_workers,
+            generator=gen,
+        )
+
+    def _make_scheduler(self, optimizer: torch.optim.Optimizer, total_steps: int, tcfg: Any) -> Any:
+        if tcfg.lr_schedule == "cosine":
+            return get_cosine_schedule_with_warmup(
+                optimizer, num_warmup_steps=int(total_steps * tcfg.warmup_ratio), num_training_steps=total_steps
+            )
+        return _build_wsd_scheduler(
+            optimizer,
+            total_steps=total_steps,
+            warmup_steps=int(total_steps * tcfg.warmup_ratio),
+            decay_steps=max(1, int(total_steps * tcfg.wsd_decay_ratio)),
+            final_lr_ratio=float(tcfg.wsd_final_lr_ratio),
         )
 
     def _run_generic_loop(
@@ -178,13 +229,12 @@ class NL2SQLTrainer:
         # Exact step count: floor division undercounted whenever the last partial
         # accumulation window remained, decaying the LR schedule to zero early.
         total_steps = max(1, math.ceil(len(train_loader) / tcfg.grad_accum_steps) * tcfg.epochs)
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer, num_warmup_steps=int(total_steps * tcfg.warmup_ratio), num_training_steps=total_steps
-        )
+        scheduler = self._make_scheduler(optimizer, total_steps, tcfg)
         amp_dtype = self._amp_dtype()
         scaler = torch.amp.GradScaler("cuda", enabled=(amp_dtype == torch.float16))
 
         start_epoch = 0
+        resume_skip_batches = 0
         global_step = 0
         best_val_loss = float("inf")
         patience_left = tcfg.early_stopping_patience
@@ -195,23 +245,47 @@ class NL2SQLTrainer:
             payload = self.ckpt_mgr.load(
                 resume_dir, model=model, optimizer=optimizer, scheduler=scheduler, scaler=scaler, map_location=str(self.device)
             )
-            # Checkpoints always record the NEXT epoch to run (epoch-boundary resume),
-            # so an interrupted run never re-processes already-trained batches while
-            # global_step (and the LR schedule) races ahead.
+            # End-of-epoch checkpoints record the NEXT epoch to run with
+            # batch_idx_in_epoch == 0; mid-epoch saves record the CURRENT epoch plus
+            # the number of its batches already processed, so resume fast-forwards
+            # through the deterministic per-epoch shuffle (itertools.islice) and
+            # processes exactly the untrained remainder -- multi-day epochs never
+            # silently skip their tail batches again.
             start_epoch = int(payload["epoch"])
+            resume_skip_batches = int(payload.get("batch_idx_in_epoch", 0) or 0)
             global_step = int(payload["global_step"])
             best_val_loss = float(payload["best_metric"])
             patience_left = int(payload.get("patience_left", tcfg.early_stopping_patience))
             history = list(payload.get("metrics_history", []))
-            logger.info("Resumed stage='%s' from %s (epoch=%d, step=%d)", stage, resume_dir, start_epoch, global_step)
+            if resume_skip_batches:
+                logger.info(
+                    "Resumed stage='%s' from %s MID-EPOCH %d at batch %d/%d",
+                    stage, resume_dir, start_epoch + 1, resume_skip_batches, len(train_loader),
+                )
+            else:
+                logger.info("Resumed stage='%s' from %s (epoch=%d, step=%d)", stage, resume_dir, start_epoch, global_step)
 
+        n_loader_batches = len(train_loader)
         for epoch in range(start_epoch, tcfg.epochs):
+            # Deterministic per-epoch shuffle: reseed the loader's generator before
+            # iteration so batch order depends only on (seed, epoch) -- identical on
+            # a resumed run, which is what mid-epoch fast-forwarding requires.
+            loader_gen = getattr(train_loader, "generator", None)
+            if loader_gen is not None:
+                loader_gen.manual_seed(self.cfg.seed + epoch)
+            skip = resume_skip_batches if epoch == start_epoch else 0
+            epoch_iter = itertools.islice(iter(train_loader), skip, None)
+
             model.train()
             optimizer.zero_grad(set_to_none=True)
             running_loss = 0.0
             n_batches = 0
 
-            for step_idx, batch in enumerate(train_loader):
+            for step_idx, batch in enumerate(epoch_iter):
+                # Absolute batch index within the epoch: grad-accum windows and the
+                # epoch-end boundary must line up with the original (pre-interruption)
+                # indexing, not with the resumed remainder's local index.
+                abs_idx = skip + step_idx
                 with torch.amp.autocast(device_type=self.device.type, dtype=amp_dtype, enabled=(amp_dtype is not None)):
                     loss = forward_step_fn(model, batch, self.device)
                     loss_scaled = loss / tcfg.grad_accum_steps
@@ -220,7 +294,7 @@ class NL2SQLTrainer:
                 running_loss += float(loss.item())
                 n_batches += 1
 
-                if (step_idx + 1) % tcfg.grad_accum_steps == 0 or (step_idx + 1) == len(train_loader):
+                if (abs_idx + 1) % tcfg.grad_accum_steps == 0 or (abs_idx + 1) == n_loader_batches:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), tcfg.max_grad_norm)
                     scaler.step(optimizer)
@@ -229,21 +303,16 @@ class NL2SQLTrainer:
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
 
-                    if global_step % tcfg.save_every_steps == 0:
-                        # Mid-epoch saves record epoch + 1: resuming continues at the
-                        # next epoch boundary instead of replaying this epoch's batches.
-                        # TRADE-OFF (documented): the remaining batches of the interrupted
-                        # epoch are skipped, while global_step (and the LR schedule)
-                        # still count them -- an interrupted large epoch therefore does
-                        # not re-run its unprocessed tail. Exact mid-epoch continuation
-                        # would require deterministic per-epoch shuffling plus a
-                        # skip-batches marker; use epoch-boundary saves instead when
-                        # every batch matters more than fast crash recovery.
+                    if global_step % tcfg.save_every_steps == 0 and (abs_idx + 1) < n_loader_batches:
+                        # Mid-epoch save: current epoch + batches already processed,
+                        # so an interrupted multi-day epoch resumes at this exact
+                        # batch instead of discarding its untrained tail.
                         self.ckpt_mgr.save(
                             stage=stage, model=model, optimizer=optimizer, scheduler=scheduler,
-                            scaler=scaler, epoch=epoch + 1, global_step=global_step,
+                            scaler=scaler, epoch=epoch, global_step=global_step,
                             best_metric=best_val_loss, config_dict=self.cfg.model_dump(mode="json"),
                             metrics_history=history, is_best=False, patience_left=patience_left,
+                            batch_idx_in_epoch=abs_idx + 1,
                         )
 
             train_loss = running_loss / max(n_batches, 1)
@@ -284,6 +353,7 @@ class NL2SQLTrainer:
                 scaler=scaler, epoch=epoch + 1, global_step=global_step,
                 best_metric=best_val_loss, config_dict=self.cfg.model_dump(mode="json"),
                 metrics_history=history, is_best=is_best, patience_left=patience_left,
+                batch_idx_in_epoch=0,
             )
             if patience_left <= 0:
                 logger.info("[%s] Early stopping triggered at epoch %d", stage, epoch + 1)
@@ -378,8 +448,19 @@ class NL2SQLTrainer:
         caches: dict[str, tuple[SchemaBundle, ValueIndex]],
         parser_dir: Path,
         max_records: int = 1200,
+        batch_size: Optional[int] = None,
     ) -> list[dict[str, Any]]:
-        """Run trained parser over train DBs to collect execution-divergence hard negatives."""
+        """Run trained parser over train DBs to collect execution-divergence hard negatives.
+
+        Records are processed in chunks of ``batch_size`` (default: cfg's
+        ``mining_batch_size``, ~32) instead of one flat 1-by-1 loop: table selection,
+        gold compilation/execution, candidate compilation/execution and sample
+        emission all run per chunk with chunk-level progress logging, so a multi-hour
+        mining pass is observable and restartable per chunk. Candidate generation
+        itself stays per record (single-source beam search API on the parser, which
+        is deliberately kept clean for the CodeT5+ baseline comparison).
+        """
+        chunk = int(batch_size or self.cfg.training.mining_batch_size)
         parser = GraphixCodeT5Parser.from_pretrained_dir(parser_dir, map_location=str(self.device)).to(self.device)
 
         art_dir = Path(self.cfg.training.output_dir) / "artifacts"
@@ -402,50 +483,58 @@ class NL2SQLTrainer:
         subset = records[:] if len(records) <= max_records else rng.sample(records, max_records)
         samples: list[dict[str, Any]] = []
 
-        for rec in subset:
-            bundle, v_idx = caches[rec.db_id]
-            if retriever is not None:
-                tables = self._serve_time_tables(rec, bundle, v_idx, retriever, linker)
-            else:
-                tables = bundle.tables[: self.cfg.models.linker_max_tables]
-            tables = tables or bundle.tables[:4]
-            val_hits = rec.value_matches or v_idx.probe(rec.question, top_k=5)
-            schema_txt = format_schema_for_parser(bundle, tables, val_hits, rec.question, rec.evidence)
+        for chunk_start in range(0, len(subset), chunk):
+            chunk_records = subset[chunk_start : chunk_start + chunk]
+            with torch.inference_mode():
+                for rec in chunk_records:
+                    bundle, v_idx = caches[rec.db_id]
+                    if retriever is not None:
+                        tables = self._serve_time_tables(rec, bundle, v_idx, retriever, linker)
+                    else:
+                        tables = bundle.tables[: self.cfg.models.linker_max_tables]
+                    tables = tables or bundle.tables[:4]
+                    val_hits = rec.value_matches or v_idx.probe(rec.question, top_k=5)
+                    schema_txt = format_schema_for_parser(bundle, tables, val_hits, rec.question, rec.evidence)
 
-            # Both gold and predicted candidates pass through the same compiler the
-            # engine uses, so the verifier cannot win by spotting raw-vs-compiled
-            # formatting differences instead of semantic errors.
-            try:
-                gold_sql = compile_and_validate_sql(rec.sql, bundle, default_limit=0).sql
-            except SQLSecurityError:
-                gold_sql = rec.sql.strip()
+                    # Both gold and predicted candidates pass through the same compiler the
+                    # engine uses, so the verifier cannot win by spotting raw-vs-compiled
+                    # formatting differences instead of semantic errors.
+                    try:
+                        gold_sql = compile_and_validate_sql(rec.sql, bundle, default_limit=0).sql
+                    except SQLSecurityError:
+                        gold_sql = rec.sql.strip()
 
-            g_ok, g_rows, _, g_msg = execute_sqlite_readonly(rec.db_path, gold_sql)
-            if g_ok and g_rows is not None:
-                samples.append({
-                    "question": rec.question, "schema_text": schema_txt, "candidate_sql": gold_sql,
-                    "exec_status": f"ok rows={len(g_rows)}", "label": 1.0,
-                })
+                    g_ok, g_rows, _, g_msg = execute_sqlite_readonly(rec.db_path, gold_sql)
+                    if g_ok and g_rows is not None:
+                        samples.append({
+                            "question": rec.question, "schema_text": schema_txt, "candidate_sql": gold_sql,
+                            "exec_status": f"ok rows={len(g_rows)}", "label": 1.0,
+                        })
 
-            cands = parser.generate_candidates(
-                schema_txt, bundle, tables, val_hits, num_candidates=3,
-                max_source_len=self.cfg.models.parser_max_source_length,
-                max_target_len=self.cfg.models.parser_max_target_length,
-                use_xgrammar=self.cfg.models.use_xgrammar,
-            )
-            for c_sql in cands:
-                try:
-                    cand_sql = compile_and_validate_sql(c_sql, bundle, default_limit=0).sql
-                except SQLSecurityError:
-                    cand_sql = c_sql.strip()
-                p_ok, p_rows, _, p_msg = execute_sqlite_readonly(rec.db_path, cand_sql)
-                is_right = bool(g_ok and p_ok and g_rows is not None and p_rows is not None and results_equivalent(rec.sql, g_rows, p_rows))
-                if not is_right:
-                    samples.append({
-                        "question": rec.question, "schema_text": schema_txt, "candidate_sql": cand_sql,
-                        "exec_status": f"ok rows={len(p_rows)}" if p_ok and p_rows is not None else f"err={p_msg[:60]}",
-                        "label": 0.0,
-                    })
+                    cands = parser.generate_candidates(
+                        schema_txt, bundle, tables, val_hits, num_candidates=3,
+                        max_source_len=self.cfg.models.parser_max_source_length,
+                        max_target_len=self.cfg.models.parser_max_target_length,
+                        use_xgrammar=self.cfg.models.use_xgrammar,
+                    )
+                    for c_sql in cands:
+                        try:
+                            cand_sql = compile_and_validate_sql(c_sql, bundle, default_limit=0).sql
+                        except SQLSecurityError:
+                            cand_sql = c_sql.strip()
+                        p_ok, p_rows, _, p_msg = execute_sqlite_readonly(rec.db_path, cand_sql)
+                        is_right = bool(g_ok and p_ok and g_rows is not None and p_rows is not None and results_equivalent(rec.sql, g_rows, p_rows))
+                        if not is_right:
+                            samples.append({
+                                "question": rec.question, "schema_text": schema_txt, "candidate_sql": cand_sql,
+                                "exec_status": f"ok rows={len(p_rows)}" if p_ok and p_rows is not None else f"err={p_msg[:60]}",
+                                "label": 0.0,
+                            })
+            if chunk_start + chunk < len(subset):
+                logger.info(
+                    "[%s] verifier mining: %d/%d records, %d samples so far",
+                    "mining", min(chunk_start + chunk, len(subset)), len(subset), len(samples),
+                )
         return samples
 
     def _calibrate_temperature(self, model: ModernBertVerifier, val_samples: list[dict[str, Any]], max_length: int) -> None:

@@ -17,6 +17,10 @@ class DataConfig(BaseModel):
     val_ratio_by_db: float = Field(default=0.15, ge=0.05, le=0.5)
     schema_perturbation_prob: float = Field(default=0.35, ge=0.0, le=1.0)
     max_distinct_values_per_col: int = Field(default=10000, ge=100)
+    # Non-text columns (ints, dates, enums) are only indexed when they carry at
+    # most this many distinct values; genuinely high-cardinality numerics (ids,
+    # amounts) stay out of the literal-grounding index.
+    low_cardinality_max_distinct: int = Field(default=100, ge=2, le=1000)
     timeout_sec: int = Field(default=120, ge=10)
 
 
@@ -57,6 +61,17 @@ class TrainingConfig(BaseModel):
     early_stopping_patience: int = Field(default=3, ge=1)
     resume_from: Optional[str] = "auto"
     num_workers: int = 2
+    # Warmup-Stable-Decay (WSD) replaces the fixed-horizon cosine by default:
+    # extending training across multiple Colab sessions never decays the LR to
+    # exactly zero, so resumed runs keep learning instead of freezing.
+    lr_schedule: Literal["wsd", "cosine"] = "wsd"
+    # LR floor during the final decay phase, as a fraction of the peak LR.
+    wsd_final_lr_ratio: float = Field(default=0.1, ge=0.0, le=1.0)
+    # Fraction of the *planned* optimizer steps reserved for the final decay phase.
+    wsd_decay_ratio: float = Field(default=0.3, ge=0.05, le=1.0)
+    # Chunk size for verifier negative mining (table selection + compilation run
+    # per chunk instead of one monolithic record loop).
+    mining_batch_size: int = Field(default=32, ge=1)
     # Cut activation memory for long-context encoders (ModernBERT at 4096 tokens on
     # free-tier GPUs) at the cost of a recompute pass.
     gradient_checkpointing: bool = False

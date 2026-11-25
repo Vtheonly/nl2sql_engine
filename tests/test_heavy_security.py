@@ -237,11 +237,12 @@ class TestCompilerLimitSemantics:
         res = compile_and_validate_sql("SELECT COUNT(*) FROM customers", sec_bundle)
         assert "LIMIT" not in res.sql.upper()
 
-    def test_union_top_level_not_limited_but_valid(self, sec_bundle) -> None:
+    def test_union_top_level_gets_guardrail_limit(self, sec_bundle) -> None:
+        # A top-level UNION previously escaped the production row guardrail
+        # entirely; it now receives the same LIMIT injection as a plain Select.
         res = compile_and_validate_sql("SELECT id FROM customers UNION SELECT id FROM orders", sec_bundle)
         assert "UNION" in res.sql.upper()
-        # documented behavior: LIMIT guard applies to plain Select, not Union
-        assert "LIMIT" not in res.sql.upper()
+        assert "LIMIT" in res.sql.upper()
 
     def test_default_limit_zero_disables_injection(self, sec_bundle) -> None:
         res = compile_and_validate_sql("SELECT * FROM customers", sec_bundle, default_limit=0)

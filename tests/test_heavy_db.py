@@ -3,13 +3,11 @@ probing edge cases, evaluator result-equivalence semantics, and read-only
 executor regressions."""
 from __future__ import annotations
 
-import sqlite3
-import time
 from pathlib import Path
 
 import pytest
 
-from nl2sql.db.introspect import ColumnInfo, JoinEdge, SchemaBundle, TableInfo, introspect_database
+from nl2sql.db.introspect import SchemaBundle, introspect_database
 from nl2sql.db.value_index import ValueIndex
 from nl2sql.evaluation.evaluator import (
     NL2SQLEvaluator,
@@ -64,10 +62,13 @@ class TestIntrospectionHardening:
     def test_case_insensitive_lookup(self, weird_bundle: SchemaBundle, query_name: str) -> None:
         assert weird_bundle.get_table(query_name) is not None
 
-    def test_composite_pk_not_marked_single_pk(self, weird_bundle: SchemaBundle) -> None:
+    def test_composite_pk_members_marked_with_pk_tag(self, weird_bundle: SchemaBundle) -> None:
         cpk = weird_bundle.get_table("cpk")
         assert cpk is not None
-        assert not any(c.is_pk for c in cpk.columns)
+        # Both composite-PK members carry the [PK] tag; each is NOT individually
+        # unique (no phantom 1:1 cardinality downstream).
+        assert all(c.is_pk for c in cpk.columns)
+        assert not any(c.is_unique for c in cpk.columns)
 
     def test_empty_table_has_no_samples(self, weird_bundle: SchemaBundle) -> None:
         empty = weird_bundle.get_table("empty_t")
@@ -185,13 +186,26 @@ class TestValueIndexHardening:
         idx.build_from_db(f"sqlite:///{db.resolve()}", bundle)
         assert idx.build_from_db(f"sqlite:///{db.resolve()}", bundle) == 0  # already built
 
-    def test_numeric_columns_not_indexed(self, tmp_path: Path) -> None:
-        db = create_sqlite(tmp_path / "n.sqlite", SHOP_DDL)
-        bundle = introspect_database(f"sqlite:///{db.resolve()}", db_id="n")
-        idx = ValueIndex(tmp_path / "ni.sqlite")
-        idx.build_from_db(f"sqlite:///{db.resolve()}", bundle)
-        hits = idx.probe("120.5 80.0")
-        assert all(h.column_name not in {"amount", "id", "customer_id"} for h in hits)
+    def test_numeric_columns_indexed_only_below_cardinality_cutoff(self, tmp_path: Path) -> None:
+        # 150 distinct amounts: above the low-cardinality cutoff, never indexed.
+        ddl = (
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, amount REAL);\n"
+            + "".join(f"INSERT INTO t VALUES ({i}, {i + 0.5});" for i in range(1, 151))
+        )
+        db = create_sqlite(tmp_path / "hi.sqlite", ddl)
+        bundle = introspect_database(f"sqlite:///{db.resolve()}", db_id="hi")
+        idx = ValueIndex(tmp_path / "hi_vi.sqlite")
+        idx.build_from_db(f"sqlite:///{db.resolve()}", bundle, low_cardinality_max_distinct=100)
+        hits = idx.probe("amounts 1.5 2.5")
+        assert all(h.column_name != "amount" for h in hits)
+
+        # SHOP_DDL amounts (3 distinct values <= 100): indexed for grounding.
+        db2 = create_sqlite(tmp_path / "lo.sqlite", SHOP_DDL)
+        bundle2 = introspect_database(f"sqlite:///{db2.resolve()}", db_id="lo")
+        idx2 = ValueIndex(tmp_path / "lo_vi.sqlite")
+        idx2.build_from_db(f"sqlite:///{db2.resolve()}", bundle2, low_cardinality_max_distinct=100)
+        lo_hits = idx2.probe("orders with amount 120.5")
+        assert any(h.column_name == "amount" and h.value == "120.5" for h in lo_hits)
 
     def test_overlong_values_skipped(self, tmp_path: Path) -> None:
         ddl = (
