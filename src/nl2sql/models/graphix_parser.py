@@ -262,7 +262,11 @@ class GraphixCodeT5Parser(nn.Module):
     def __init__(self, model_id_or_path: str = "Salesforce/codet5p-220m") -> None:
         super().__init__()
         self.tokenizer = load_tokenizer(model_id_or_path)
-        self.model = T5ForConditionalGeneration.from_pretrained(model_id_or_path)
+        # Materialize fp32 weights: codet5p-220m ships fp16, and an fp16 model
+        # overflows the T5 SDPA position-bias mask on transformers 5.2x
+        # ("value cannot be converted to type c10::Half without overflow").
+        # Autocast governs the compute dtype where mixed precision is supported.
+        self.model = T5ForConditionalGeneration.from_pretrained(model_id_or_path, dtype=torch.float32)
         added = self.tokenizer.add_special_tokens(
             {"additional_special_tokens": [TBL_TOKEN, COL_TOKEN, "[PK]", "[FK]", "[VAL]", SCHEMA_TOKEN]}
         )

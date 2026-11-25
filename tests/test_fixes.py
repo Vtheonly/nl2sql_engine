@@ -1248,3 +1248,14 @@ def test_amp_dtype_bf16_unsupported_gpu_degrades_to_fp32(monkeypatch, tmp_path):
 
     cfg.training.mixed_precision = "no"
     assert trainer._amp_dtype() is None
+
+
+def test_graphix_parser_materializes_fp32_weights(tiny_t5_dir):
+    """codet5p-220m ships fp16 weights; the parser must materialize fp32 or the
+    transformers-5.2x T5 SDPA position-bias mask overflows c10::Half mid-forward
+    ("value cannot be converted to type c10::Half without overflow")."""
+    from nl2sql.models.graphix_parser import GraphixCodeT5Parser
+
+    parser = GraphixCodeT5Parser(str(tiny_t5_dir))
+    dtypes = {p.dtype for p in parser.model.parameters()}
+    assert dtypes == {torch.float32}
