@@ -139,8 +139,19 @@ class NL2SQLTrainer:
     def _amp_dtype(self) -> Optional[torch.dtype]:
         if self.device.type != "cuda" or self.cfg.training.mixed_precision == "no":
             return None
-        if self.cfg.training.mixed_precision == "bf16" and torch.cuda.is_bf16_supported():
-            return torch.bfloat16
+        if self.cfg.training.mixed_precision == "bf16":
+            if torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+            # Degrade to fp32, NOT fp16: on bf16-incapable GPUs (e.g. T4),
+            # transformers 5.2x's T5 SDPA position-bias path overflows c10::Half
+            # ("value cannot be converted to type c10::Half without overflow"),
+            # so a silent bf16->fp16 substitution kills training mid-forward.
+            logger.warning(
+                "mixed_precision='bf16' requested but this GPU lacks bf16 support; "
+                "training in fp32 instead of silently downgrading to fp16 "
+                "(fp16 also overflows the T5 position-bias path on transformers 5.2x)."
+            )
+            return None
         return torch.float16
 
     def _loader(self, dataset: Any, collate: Any, batch_size: int, shuffle: bool) -> DataLoader:

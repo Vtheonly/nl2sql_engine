@@ -1215,3 +1215,36 @@ def test_load_tokenizer_passes_through_unrelated_errors(monkeypatch, tmp_path, t
 
     with pytest.raises(TypeError, match="some unrelated"):
         load_tokenizer(str(local_dir))
+
+
+def test_amp_dtype_bf16_unsupported_gpu_degrades_to_fp32(monkeypatch, tmp_path):
+    """bf16 requested on a bf16-incapable GPU must degrade to fp32 (None), never silently to fp16.
+
+    T4-class GPUs cannot run bf16; the pre-fix code silently fell through to
+    torch.float16, which overflows the T5 SDPA position-bias path on
+    transformers 5.2x ("value cannot be converted to type c10::Half").
+    """
+    from nl2sql.config import EngineConfig, TrainingConfig
+    from nl2sql.training.trainer import NL2SQLTrainer
+
+    cfg = EngineConfig(
+        project_name="amp-test",
+        work_dir=tmp_path,
+        training=TrainingConfig(
+            stage="parser", output_dir=tmp_path / "run", mixed_precision="bf16", device="cuda"
+        ),
+    )
+    trainer = NL2SQLTrainer(cfg)
+    assert trainer.device.type == "cuda"
+
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+    assert trainer._amp_dtype() is None, "bf16-unsupported GPU must train fp32, not silently fp16"
+
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+    assert trainer._amp_dtype() == torch.bfloat16
+
+    cfg.training.mixed_precision = "fp16"
+    assert trainer._amp_dtype() == torch.float16, "explicit fp16 stays fp16"
+
+    cfg.training.mixed_precision = "no"
+    assert trainer._amp_dtype() is None
