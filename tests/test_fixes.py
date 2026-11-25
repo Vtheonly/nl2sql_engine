@@ -7,12 +7,18 @@ synthesis, fan-out false abstention, evaluation LIMIT injection, empty-gold-tabl
 training data, schema cache drift, Unicode/single-char value indexing, 64-bit
 result comparison, row caps, health surface, serve-time verifier mining, and
 trainer bookkeeping (exact total_steps, patience persistence, epoch-boundary resume).
+
+Round 2 pins: mixed-case fan-out detection, per-Select alias scoping, Foreign
+Keys/<pad> owner bleed, EBNF IIF/unary-minus/SQLite function coverage, RBAC
+value-match leakage, column_meanings cache-hit merging, verifier best-checkpoint
+calibration, and serve --db / POST /register operability.
 """
 from __future__ import annotations
 
 import json
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -688,24 +694,322 @@ def test_verifier_mining_compiles_gold_and_candidates(tmp_path: Path, tiny_t5_di
             assert s["candidate_sql"].upper().startswith("SELECT")
 
 
-def test_temperature_calibration_fits_reasonable_temperature(tmp_path: Path, tiny_modernbert_dir):
+# --------------------------------------------------------------------------
+# Notebook contract: repo link
+# --------------------------------------------------------------------------
+
+def test_notebook_pulls_repo_directly():
+    nb = json.loads((Path(__file__).resolve().parents[1] / "notebooks" / "train_nl2sql.ipynb").read_text(encoding="utf-8"))
+    code = "\n".join("".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code")
+    md = "\n".join("".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "markdown")
+    assert "https://github.com/Vtheonly/nl2sql_engine" in md + code
+    assert 'os.environ.get("NL2SQL_REPO_URL", "https://github.com/Vtheonly/nl2sql_engine.git")' in code
+
+
+# --------------------------------------------------------------------------
+# Round-2 audit fixes: mixed-case fan-out, per-Select alias scoping, Foreign
+# Keys/<pad> owner bleed, EBNF SQLite coverage, RBAC literal leak, cached
+# column_meanings, verifier best-checkpoint calibration, serve --db/register
+# --------------------------------------------------------------------------
+
+def _mixed_case_bundle() -> SchemaBundle:
+    """BIRD-style mixed-case schema: Orders/Tickets both N:1 children of Customers."""
+    tables = [
+        TableInfo(name="Customers", columns=[ColumnInfo(name="Id", data_type="INTEGER", is_pk=True), ColumnInfo(name="Name", data_type="TEXT")]),
+        TableInfo(name="Orders", columns=[ColumnInfo(name="Id", data_type="INTEGER", is_pk=True), ColumnInfo(name="CustomerId", data_type="INTEGER"), ColumnInfo(name="Amount", data_type="REAL")]),
+        TableInfo(name="Tickets", columns=[ColumnInfo(name="Id", data_type="INTEGER", is_pk=True), ColumnInfo(name="CustomerId", data_type="INTEGER"), ColumnInfo(name="Status", data_type="TEXT")]),
+    ]
+    edges = [
+        JoinEdge(left_table="Orders", left_column="CustomerId", right_table="Customers", right_column="Id", cardinality="N:1"),
+        JoinEdge(left_table="Tickets", left_column="CustomerId", right_table="Customers", right_column="Id", cardinality="N:1"),
+    ]
+    return SchemaBundle(db_id="mix", dialect="sqlite", ddl_hash="h", tables=tables, join_edges=edges)
+
+
+def test_fanout_detection_flags_mixed_case_tables():
+    # Identical query spelled with mixed-case table names (common in BIRD) must be
+    # flagged exactly like its lowercase twin: canonical names are lowercased when
+    # resolving join-edge parents.
+    bundle = _mixed_case_bundle()
+    sql = (
+        "SELECT c.Name, SUM(o.Amount), COUNT(t.Id) FROM Customers c "
+        "JOIN Orders o ON c.Id = o.CustomerId JOIN Tickets t ON c.Id = t.CustomerId GROUP BY c.Name"
+    )
+    res = compile_and_validate_sql(sql, bundle, default_limit=0)
+    assert res.fanout_warnings, "mixed-case spelling silently skipped fan-out detection"
+    assert any("fan-out" in f.lower() for f in res.ambiguity_flags)
+
+
+def test_fanout_alias_resolution_is_per_select_not_global():
+    # The subquery reuses alias 'o' for a *different* table (Tickets). A global
+    # scope resolves SUM(o.Amount) to Tickets and misses the fan-out; each column
+    # must resolve against the FROM/JOINs of its own enclosing Select.
+    bundle = _mixed_case_bundle()
+    sql = (
+        "SELECT c.Name, (SELECT COUNT(o.Id) FROM Tickets o), SUM(o.Amount) "
+        "FROM Customers c JOIN Orders o ON c.Id = o.CustomerId"
+    )
+    res = compile_and_validate_sql(sql, bundle, default_limit=0)
+    assert res.fanout_warnings, "per-Select alias resolution missed a genuine fan-out"
+
+
+def test_parse_schema_owners_clears_foreign_keys_and_pad_boundary():
+    tables = _mixed_case_bundle().tables
+    prompt = format_schema_for_parser(_mixed_case_bundle(), tables, [], "how many", "")
+    assert "Foreign Keys:" in prompt
+    toks = prompt.replace("\n", " ").split() + ["<pad>"] * 3
+    q_end = toks.index("[SCHEMA]")
+    owner_table, owner_col = GraphixCodeT5Parser._parse_schema_owners(toks, tables, q_end)
+
+    # Table blocks themselves still resolve to owners ("Customers:" carries the
+    # trailing colon of the prompt's [TBL] header format).
+    def _pos(prefix: str) -> int:
+        return next(i for i, t in enumerate(toks) if str(t).startswith(prefix))
+
+    for name in ("Customers", "Orders", "Tickets"):
+        idx = _pos(name)
+        assert all(owner_table[i] is not None for i in range(idx, idx + 2)), f"{name} block lost its owner"
+
+    # The Foreign Keys summary line and the trailing <pad> fillers must NOT inherit
+    # the last table's owner (spurious REL_SAME_TABLE / REL_FK_EDGE biases).
+    fk_start = toks.index("Foreign")
+    assert all(o is None for o in owner_table[fk_start:]), "Foreign Keys line bled into table owner spans"
+    assert all(o is None for o in owner_col[fk_start:])
+
+
+def test_ebnf_covers_iif_unary_minus_and_common_sqlite_functions():
+    """String-level grammar walk: the previously-rejected BIRD/SQLite constructs parse."""
+    xgrammar = pytest.importorskip("xgrammar", reason="optional extra 'constrained' not installed")
+    import re as _re
+
+    tables = [
+        TableInfo(name="orders", columns=[
+            ColumnInfo(name="id", data_type="INTEGER"), ColumnInfo(name="total", data_type="REAL"),
+            ColumnInfo(name="status", data_type="TEXT"),
+        ]),
+        TableInfo(name="customers", columns=[
+            ColumnInfo(name="id", data_type="INTEGER"), ColumnInfo(name="name", data_type="TEXT"),
+        ]),
+    ]
+    t_info = xgrammar.TokenizerInfo(["<pad>", "</s>"], vocab_size=2)
+    compiler = xgrammar.GrammarCompiler(t_info, cache_enabled=False)
+
+    def grammar_accepts(sql: str) -> bool:
+        compiled = compiler.compile_grammar(build_sqlite_schema_ebnf(tables, []))
+        matcher = xgrammar.GrammarMatcher(compiled)
+        for piece in _re.findall(r"\s*(?:'[^']*'|[A-Za-z_][A-Za-z0-9_]*|[0-9]+(?:\.[0-9]+)?|\S)", sql):
+            if not matcher.accept_string(piece):
+                return False
+        return matcher.is_completed()
+
+    accepted = [
+        "SELECT IIF(total > 100, 1, 0) FROM orders",       # IIF: first arg is a cond
+        "SELECT SUM(IIF(status = 'open', 1, 0)) FROM orders",
+        "SELECT - total FROM orders",                        # unary negation on a column
+        "SELECT - ( total + 1 ) FROM orders",                # unary negation on parens
+        "SELECT id FROM orders WHERE - total < 5",
+        "SELECT NULLIF(total, 0) FROM orders",
+        "SELECT GROUP_CONCAT(name) FROM customers",
+        "SELECT GROUP_CONCAT(name, ',') FROM customers",
+        "SELECT GROUP_CONCAT(DISTINCT name) FROM customers",
+        "SELECT TOTAL(total) FROM orders",
+        "SELECT INSTR(name, 'a') FROM customers",
+        "SELECT SIGN(total) FROM orders",
+        "SELECT TYPEOF(total) FROM orders",
+        "SELECT id FROM orders WHERE total < -5",            # negative literals kept
+        "SELECT CAST(SUM(total) AS INTEGER) FROM orders",    # pre-existing coverage intact
+    ]
+    for sql in accepted:
+        assert grammar_accepts(sql), f"grammar rejected valid SQLite: {sql}"
+
+    rejected = ["SELECT ghost FROM orders", "SELECT total FROM ghosts", "SELECT NOPEFN(total) FROM orders"]
+    for sql in rejected:
+        assert not grammar_accepts(sql), f"grammar accepted invalid SQL: {sql}"
+
+
+def test_engine_rbac_filters_value_matches_from_prompt(tmp_path, engine_config, shop_db, shop_bundle):
+    from nl2sql.db.value_index import ValueMatch
+    from nl2sql.retrieval.schema_retriever import RetrievalResult
+
+    engine = NL2SQLEngine(engine_config, artifacts_dir=Path(engine_config.training.output_dir) / "artifacts", device="cpu")
+    v_idx = ValueIndex(tmp_path / "vi_rbac.sqlite")
+    v_idx.build_from_db(f"sqlite:///{shop_db.resolve()}", shop_bundle)
+    engine.db_registry["shop"] = (shop_bundle, v_idx, shop_db)
+
+    matches = [
+        ValueMatch(table_name="tickets", column_name="status", value="open", matched_phrase="open", score=1.0),
+        ValueMatch(table_name="customers", column_name="name", value="Alice", matched_phrase="Alice", score=1.0),
+    ]
+
+    class _FixedRetriever:
+        def retrieve(self, question, bundle, value_index):
+            return RetrievalResult(candidate_tables=list(bundle.tables), value_matches=matches, example_hints=[])
+
+    engine.retriever = _FixedRetriever()
+
+    captured: dict[str, Any] = {}
+
+    def fake_generate(self, source_text, bundle, tables, value_matches, **kw):
+        captured["value_matches"] = value_matches
+        captured["source_text"] = source_text
+        return ["SELECT name FROM customers"]
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(GraphixCodeT5Parser, "generate_candidates", fake_generate)
+    try:
+        resp = engine.answer(
+            db_id="shop", question="how many open tickets for Alice",
+            allowed_tables=["customers"],
+        )
+        assert not resp.abstained, resp.reason
+        # Grounded literals from forbidden tables must not leak into the parser prompt
+        # or the XGrammar literal grounding.
+        assert [v.table_name for v in captured["value_matches"]] == ["customers"]
+        assert "tickets.status" not in captured["source_text"]
+        assert "customers.name = 'Alice'" in captured["source_text"]
+
+        # Negative control: without an allowlist both tables' literals are grounded.
+        engine.answer(db_id="shop", question="how many open tickets for Alice")
+        assert {v.table_name for v in captured["value_matches"]} == {"tickets", "customers"}
+    finally:
+        monkeypatch.undo()
+
+
+def test_build_db_caches_merges_column_meanings_on_cache_hit(tmp_path: Path):
+    ddl = "CREATE TABLE sales (id INTEGER PRIMARY KEY, amount REAL, bonus REAL)"
+    db = create_sqlite(tmp_path / "meaning.sqlite", ddl + "; INSERT INTO sales VALUES (1, 10, 5)")
+
+    # First pass: no meanings provided -> cached without descriptions.
+    caches = build_db_caches({"sq": db}, cache_dir=tmp_path / "cache")
+    assert all(c.business_description is None for c in caches["sq"][0].get_table("sales").columns)
+
+    # Second pass: same DDL (cache hit) but new column_meanings must be merged,
+    # not silently ignored, and must persist to disk.
+    caches2 = build_db_caches(
+        {"sq": db}, cache_dir=tmp_path / "cache",
+        column_meanings={"sq|sales|bonus": "yearly bonus"},
+    )
+    bundle = caches2["sq"][0]
+    cols = {c.name: c.business_description for c in bundle.get_table("sales").columns}
+    assert cols["bonus"] == "yearly bonus"
+    assert cols["amount"] is None, "unrelated columns stay untouched"
+    # Persisted: a cold reload from disk sees the same descriptions.
+    reloaded = SchemaBundle.load(tmp_path / "cache" / "sq" / "schema_bundle.json")
+    assert reloaded.get_table("sales").get_column("bonus").business_description == "yearly bonus"
+
+
+def test_register_database_merges_column_meanings_on_cache_hit(tmp_path, engine_config, shop_db):
+    engine = NL2SQLEngine(engine_config, artifacts_dir=Path(engine_config.training.output_dir) / "artifacts", device="cpu")
+    url = f"sqlite:///{shop_db.resolve()}"
+    engine.register_database("shop", url, cache_dir=tmp_path / "cache")
+    first = engine.db_registry["shop"][0]
+    assert all(c.business_description is None for c in first.get_table("customers").columns)
+
+    engine.register_database(
+        "shop", url, cache_dir=tmp_path / "cache",
+        column_meanings={"shop|customers|name": "full customer name"},
+    )
+    second = engine.db_registry["shop"][0]
+    assert second.get_table("customers").get_column("name").business_description == "full customer name"
+    # And the merge is persisted, not just in-memory.
+    on_disk = SchemaBundle.load(tmp_path / "cache" / "shop" / "schema_bundle.json")
+    assert on_disk.get_table("customers").get_column("name").business_description == "full customer name"
+
+
+def test_serve_registers_cli_databases(tmp_path, engine_config, shop_db):
+    from nl2sql import serve as serve_mod
+
+    engine = NL2SQLEngine(engine_config, artifacts_dir=Path(engine_config.training.output_dir) / "artifacts", device="cpu")
+    registered = serve_mod.register_databases_at_startup(
+        engine, [f"shop=sqlite:///{shop_db.resolve()}"], cache_dir=tmp_path / "cache"
+    )
+    assert registered == ["shop"]
+    assert "shop" in engine.db_registry
+    assert engine.db_registry["shop"][0].get_table("customers") is not None
+
+    # Malformed specs fail loudly instead of registering garbage.
+    with pytest.raises(SystemExit, match="Invalid --db spec"):
+        serve_mod.register_databases_at_startup(engine, ["shop-no-url"], cache_dir=tmp_path / "cache")
+
+
+def test_serve_main_passes_db_flag_to_engine(tmp_path, engine_config, shop_db, monkeypatch):
+    import uvicorn
+    from nl2sql import serve as serve_mod
+    from nl2sql.config import save_config
+
+    config_path = tmp_path / "serve_cfg.yaml"
+    save_config(engine_config, config_path)
+
+    seen: dict[str, Any] = {}
+
+    def fake_create_app(eng):
+        seen["engine"] = eng
+        return object()
+
+    monkeypatch.setattr(serve_mod, "create_app", fake_create_app)
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: seen.setdefault("app", app))
+
+    serve_mod.main(argv=[
+        "--config", str(config_path),
+        "--db", f"shop=sqlite:///{shop_db.resolve()}",
+        "--port", "8123",
+    ])
+    assert "shop" in seen["engine"].db_registry
+
+
+def test_register_endpoint_registers_database_at_runtime(tmp_path, engine_config, shop_db):
+    from fastapi.testclient import TestClient
+
+    engine = NL2SQLEngine(engine_config, artifacts_dir=Path(engine_config.training.output_dir) / "artifacts", device="cpu")
+    client = TestClient(create_app(engine))
+
+    resp = client.post("/register", json={
+        "db_id": "shop",
+        "connection_url": f"sqlite:///{shop_db.resolve()}",
+        "cache_dir": str(tmp_path / "cache"),
+        "column_meanings": {"shop|customers|name": "full customer name"},
+        "example_queries": [{"question": "customers?", "sql": "SELECT COUNT(*) FROM customers"}],
+    })
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["db_id"] == "shop" and body["tables"] >= 3
+    assert client.get("/health").json()["registered_databases"] == ["shop"]
+    bundle = engine.db_registry["shop"][0]
+    assert bundle.get_table("customers").get_column("name").business_description == "full customer name"
+
+    # Broken connection URLs surface as HTTP 400, not an unhandled crash.
+    bad = client.post("/register", json={"db_id": "bad", "connection_url": "not-a-url"})
+    assert bad.status_code == 400
+    assert "registration failed" in bad.json()["detail"].lower()
+
+    # The freshly registered DB actually serves /query.
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        GraphixCodeT5Parser, "generate_candidates",
+        lambda self, source_text, bundle, tables, value_matches, **kw: ["SELECT name FROM customers"],
+    )
+    try:
+        q = client.post("/query", json={"db_id": "shop", "question": "list all the people"})
+        assert q.status_code == 200
+        assert not q.json()["abstained"]
+    finally:
+        monkeypatch.undo()
+
+
+def test_temperature_calibration_actually_fits_temperature(tmp_path: Path, tiny_modernbert_dir):
     from nl2sql.models.verifier import ModernBertVerifier
     from nl2sql.training.trainer import NL2SQLTrainer
 
-    cfg = make_engine_config(tmp_path, tiny_t5_dir := tiny_modernbert_dir, tiny_modernbert_dir, epochs=1)
+    cfg = make_engine_config(tmp_path, tiny_modernbert_dir, tiny_modernbert_dir, epochs=1)
     trainer = NL2SQLTrainer(cfg)
     model = ModernBertVerifier(str(tiny_modernbert_dir))
 
-    # Synthetic validation logits: positives around +4, negatives around -4. The
-    # calibrated temperature must land in a sane range and be persisted.
     val_samples = [
         {"question": "q", "schema_text": "s", "candidate_sql": "SELECT 1", "exec_status": "ok rows=1", "label": float(i % 2)}
         for i in range(16)
     ]
-    with torch.no_grad():
-        for i, s in enumerate(val_samples):
-            pass
-    # Force logits by monkeypatching forward to return preset logits per label.
+    # Constant per-batch logits with mixed labels: calibration must move T off 1.0
+    # (the old silent-failure mode left T == 1.0 and still "passed").
     preset = {0: -4.0, 1: 4.0}
 
     def fake_forward(self, input_ids, attention_mask, labels=None):
@@ -720,15 +1024,91 @@ def test_temperature_calibration_fits_reasonable_temperature(tmp_path: Path, tin
         monkeypatch.undo()
     t = float(model.temperature.item())
     assert 0.05 <= t <= 10.0
+    assert abs(t - 1.0) > 1e-6, "temperature calibration silently no-op'd (stayed at 1.0)"
 
 
-# --------------------------------------------------------------------------
-# Notebook contract: repo link
-# --------------------------------------------------------------------------
+def test_train_verifier_calibrates_and_saves_best_epoch_weights(
+    tmp_path: Path, tiny_t5_dir: Path, tiny_modernbert_dir: Path, training_setup
+):
+    """train_verifier must reload the BEST artifact before calibration: the in-memory
+    model after early stopping sits on the (possibly overfit) final epoch, and
+    calibrating + saving that would clobber the best checkpoint."""
+    from nl2sql.models.verifier import ModernBertVerifier
+    from nl2sql.training.trainer import NL2SQLTrainer
 
-def test_notebook_pulls_repo_directly():
-    nb = json.loads((Path(__file__).resolve().parents[1] / "notebooks" / "train_nl2sql.ipynb").read_text(encoding="utf-8"))
-    code = "\n".join("".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "code")
-    md = "\n".join("".join(c["source"]) for c in nb["cells"] if c["cell_type"] == "markdown")
-    assert "https://github.com/Vtheonly/nl2sql_engine" in md + code
-    assert 'os.environ.get("NL2SQL_REPO_URL", "https://github.com/Vtheonly/nl2sql_engine.git")' in code
+    records, caches = training_setup
+    cfg = make_engine_config(tmp_path, tiny_t5_dir, tiny_modernbert_dir, epochs=2, stage="verifier")
+    cfg.training.num_workers = 0
+    cfg.training.save_every_steps = 10**9  # epoch-boundary checkpoints only
+    trainer = NL2SQLTrainer(cfg)
+
+    parser_art = Path(cfg.training.output_dir) / "artifacts" / "parser"
+    parser_art.mkdir(parents=True, exist_ok=True)  # existence gate only; mining is stubbed
+
+    t_samples = [
+        {"question": "q", "schema_text": "s", "candidate_sql": "SELECT 1", "exec_status": "ok rows=1", "label": float(i % 2)}
+        for i in range(12)
+    ]
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        NL2SQLTrainer, "mine_verifier_samples",
+        lambda self, records, caches, parser_dir, max_records=1500: t_samples,
+    )
+
+    # Strictly increasing additive loss per labeled forward call -> epoch 2 is
+    # deterministically WORSE than epoch 1, so the best artifact is epoch 1's.
+    fwd_calls = {"n": 0}
+    real_forward = ModernBertVerifier.forward
+
+    def counting_forward(self, input_ids, attention_mask, labels=None):
+        fwd_calls["n"] += 1
+        out = real_forward(self, input_ids, attention_mask, labels)
+        if labels is not None:
+            out["loss"] = out["loss"] + 0.5 * fwd_calls["n"]
+        return out
+
+    def _fp(m) -> float:
+        return sum(float(v.double().sum()) for v in m.state_dict().values())
+
+    events: list[tuple[str, float]] = []
+    real_save = ModernBertVerifier.save_pretrained
+
+    def recording_save(self, save_dir):
+        events.append(("save", _fp(self)))
+        return real_save(self, save_dir)
+
+    real_calibrate = NL2SQLTrainer._calibrate_temperature
+
+    def recording_calibrate(self_, model, val_samples, max_length):
+        events.append(("calibrate", _fp(model)))
+        return real_calibrate(self_, model, val_samples, max_length)
+
+    real_loop = NL2SQLTrainer._run_generic_loop
+
+    def recording_loop(self_, *args, **kwargs):
+        out = real_loop(self_, *args, **kwargs)
+        events.append(("loop_end", _fp(args[1])))  # args[1] is the model
+        return out
+
+    monkeypatch.setattr(ModernBertVerifier, "forward", counting_forward)
+    monkeypatch.setattr(ModernBertVerifier, "save_pretrained", recording_save)
+    monkeypatch.setattr(NL2SQLTrainer, "_calibrate_temperature", recording_calibrate)
+    monkeypatch.setattr(NL2SQLTrainer, "_run_generic_loop", recording_loop)
+    try:
+        trainer.train_verifier(records, records, caches)
+    finally:
+        monkeypatch.undo()
+
+    calib_idx = [i for i, e in enumerate(events) if e[0] == "calibrate"][-1]
+    best_writes = [e[1] for i, e in enumerate(events[:calib_idx]) if e[0] == "save"]
+    final_fp = [e[1] for i, e in enumerate(events[:calib_idx]) if e[0] == "loop_end"][-1]
+    assert best_writes, "no best-epoch artifact write captured"
+    assert events[calib_idx][1] == best_writes[-1], "calibration ran on weights other than the best artifact"
+    assert events[calib_idx][1] != final_fp, "calibration ran on the final-epoch (non-best) in-memory weights"
+
+    # The persisted artifact carries the calibrated temperature and reloads cleanly.
+    verifier_dir = Path(cfg.training.output_dir) / "artifacts" / "verifier"
+    meta = json.loads((verifier_dir / "verifier_meta.json").read_text())
+    assert isinstance(meta["temperature"], float)
+    reloaded = ModernBertVerifier.from_pretrained_dir(verifier_dir)
+    assert abs(float(reloaded.temperature.item()) - meta["temperature"]) < 1e-6

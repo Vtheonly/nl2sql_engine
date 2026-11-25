@@ -133,12 +133,14 @@ cond_atom ::= ("NOT" ws)? (
 )
 comp_op ::= "=" | "!=" | "<>" | "<" | "<=" | ">" | ">="
 expr ::= term (ws ("+" | "-" | "*" | "/" | "||") ws term)*
-term ::= agg_call | scalar_call | case_expr | col_ref | literal | "(" ws? (expr | select_core) ws? ")"
-agg_call ::= ("COUNT" | "SUM" | "AVG" | "MIN" | "MAX") "(" ("DISTINCT" ws)? ("*" | expr) ")"
-scalar_call ::= ("ABS" | "ROUND" | "CAST" | "COALESCE" | "IFNULL" | "IIF" | "STRFTIME" | "SUBSTR" | "LENGTH" | "LOWER" | "UPPER" | "JULIANDAY") "(" expr (ws "AS" ws type_name | ("," ws expr)*) ")"
+term ::= agg_call | group_concat | scalar_call | iif_call | case_expr | col_ref | literal | "(" ws? (expr | select_core) ws? ")" | "-" ws? term
+agg_call ::= ("COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "TOTAL") "(" ("DISTINCT" ws)? ("*" | expr) ")"
+group_concat ::= "GROUP_CONCAT" "(" ("DISTINCT" ws)? expr (ws? "," ws? expr)? ")"
+scalar_call ::= ("ABS" | "ROUND" | "CAST" | "COALESCE" | "IFNULL" | "NULLIF" | "INSTR" | "SIGN" | "TYPEOF" | "STRFTIME" | "SUBSTR" | "LENGTH" | "LOWER" | "UPPER" | "JULIANDAY") "(" expr (ws "AS" ws type_name | ("," ws expr)*) ")"
+iif_call ::= "IIF" "(" ws? cond ws? "," ws? expr ws? "," ws? expr ws? ")"
 type_name ::= [A-Za-z]+ (ws "(" ws [0-9]+ ("," ws [0-9]+)? ws ")")?
 case_expr ::= "CASE" (ws expr)? (ws "WHEN" ws cond ws "THEN" ws expr)+ (ws "ELSE" ws expr)? ws "END"
-literal ::= "-"? [0-9]+ ("." [0-9]+)? | {string_rule} | "NULL"
+literal ::= [0-9]+ ("." [0-9]+)? | {string_rule} | "NULL"
 table_name ::= {tbl_alts}
 col_ref ::= ({col_alts}) | ident "." ({col_only_alts})
 ident ::= [a-zA-Z_][a-zA-Z0-9_]* | quoted_ident
@@ -360,6 +362,18 @@ class GraphixCodeT5Parser(nn.Module):
         while idx < seq_len:
             tok = toks[idx]
             clean = _clean_token(tok)
+
+            if clean == "foreign" or clean == "<pad>":
+                # The trailing "Foreign Keys:" summary line and any <pad> fillers sit
+                # outside every [TBL] block. Without an explicit reset they inherit
+                # the last table's owner and receive spurious REL_SAME_TABLE /
+                # REL_FK_EDGE biases. ("foreign" only ever reaches this top-level
+                # check as the header; table/column names are consumed inside
+                # their own [TBL]/[COL] spans below.)
+                cur_tbl = cur_tbl_norm = None
+                cur_col = None
+                idx += 1
+                continue
 
             if clean == _clean_token(TBL_TOKEN):
                 # Longest-prefix match of the joined token pieces against table names.

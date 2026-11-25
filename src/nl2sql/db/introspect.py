@@ -184,6 +184,28 @@ def compute_ddl_hash(connection_url: str) -> str:
         engine.dispose()
 
 
+def apply_column_meanings(bundle: SchemaBundle, db_id: str, column_meanings: Optional[dict[str, str]]) -> bool:
+    """Merge caller-supplied column descriptions into an existing bundle.
+
+    ``ddl_hash`` covers only (table, column, type, PK) structure, so a cached
+    bundle is reused whenever the DDL is unchanged -- even when the caller now
+    provides ``column_meanings`` that were absent when the cache was written.
+    Without this merge those descriptions would be silently ignored. Returns
+    True when the bundle actually changed (callers persist it then).
+    """
+    if not column_meanings:
+        return False
+    changed = False
+    for t in bundle.tables:
+        for c in t.columns:
+            key = f"{db_id}|{t.name}|{c.name}"
+            desc = column_meanings.get(key) or column_meanings.get(key.lower())
+            if desc is not None and desc != c.business_description:
+                c.business_description = desc
+                changed = True
+    return changed
+
+
 def introspect_database(
     connection_url: str,
     db_id: str,

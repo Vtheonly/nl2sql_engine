@@ -49,12 +49,16 @@ end-to-end Colab/Kaggle orchestrator.
 ### Serve
 
 ```bash
-python -m nl2sql.serve --config configs/default_train.yaml --port 8000
-# or: nl2sql-serve
+# Register databases directly from the CLI (repeatable) so /query works out of the box:
+python -m nl2sql.serve --config configs/default_train.yaml --port 8000 \
+    --db shop=sqlite:///shop.sqlite --db hr=sqlite:///hr.sqlite
+# or: nl2sql-serve --db shop=sqlite:///shop.sqlite
 ```
 
-Endpoints: `GET /health` (models loaded, registered DBs) and `POST /query`
-(`db_id`, `question`, `evidence`, `allowed_tables`, `execute`, `default_limit`).
+Endpoints: `GET /health` (models loaded, registered DBs), `POST /register`
+(`db_id`, `connection_url`, optional `cache_dir`/`column_meanings`/`example_queries`)
+and `POST /query` (`db_id`, `question`, `evidence`, `allowed_tables`, `execute`,
+`default_limit`).
 
 ```python
 from nl2sql.engine import NL2SQLEngine, create_app
@@ -65,6 +69,15 @@ engine.register_database("my_db", "sqlite:///my.db", cache_dir="./cache",
                           example_queries=[{"question": "...", "sql": "SELECT ..."}])
 app = create_app(engine)
 ```
+
+### Checkpointing & resume
+
+`resume_from: auto` restores model/optimizer/scheduler/RNG state plus early-stopping
+patience and best-metric bookkeeping. Mid-epoch checkpoints (`save_every_steps`)
+record the *next* epoch boundary, so an interrupted epoch's remaining batches are
+skipped on resume (no duplicate-batch replay) while `global_step` and the LR
+schedule stay consistent — documented trade-off favoring crash recovery over exact
+mid-epoch continuation.
 
 ## Testing
 

@@ -11,7 +11,13 @@ from sqlglot import exp
 from pydantic import BaseModel, Field
 from torch.utils.data import Dataset
 
-from nl2sql.db.introspect import SchemaBundle, TableInfo, compute_ddl_hash, introspect_database
+from nl2sql.db.introspect import (
+    SchemaBundle,
+    TableInfo,
+    apply_column_meanings,
+    compute_ddl_hash,
+    introspect_database,
+)
 from nl2sql.db.value_index import ValueIndex, ValueMatch
 from nl2sql.datasets.acquire import DatasetAcquisitionResult
 from nl2sql.utils.logging import get_logger
@@ -127,6 +133,12 @@ def build_db_caches(
             live_hash = compute_ddl_hash(conn_url)
             if live_hash == cached.ddl_hash:
                 bundle = cached
+                # DDL-identical cache hit: still honor newly supplied column_meanings
+                # (the hash does not cover descriptions, so they would otherwise be
+                # silently ignored on a hit).
+                if apply_column_meanings(bundle, db_id, column_meanings):
+                    logger.info("Merged updated column_meanings into cached bundle for db_id '%s'.", db_id)
+                    bundle.save(bundle_path)
             else:
                 logger.warning("Cached schema for db_id '%s' is stale (DDL changed); re-introspecting.", db_id)
         if bundle is None:

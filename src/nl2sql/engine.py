@@ -15,7 +15,7 @@ from sqlalchemy.engine import make_url
 from nl2sql.compiler.sql_compiler import SQLSecurityError, compile_and_validate_sql
 from nl2sql.config import EngineConfig
 from nl2sql.datasets.prepare import format_schema_for_parser
-from nl2sql.db.introspect import SchemaBundle, compute_ddl_hash, introspect_database
+from nl2sql.db.introspect import SchemaBundle, apply_column_meanings, compute_ddl_hash, introspect_database
 from nl2sql.db.value_index import ValueIndex
 from nl2sql.evaluation.evaluator import execute_sqlite_readonly
 from nl2sql.models.graphix_parser import GraphixCodeT5Parser
@@ -47,6 +47,16 @@ class QueryRequest(BaseModel):
     # Set to null to disable (evaluation paths must disable it, otherwise gold queries
     # returning more rows than the cap are silently truncated and scored wrong).
     default_limit: Optional[int] = 200
+
+
+class RegisterRequest(BaseModel):
+    """POST /register payload: register (or refresh) a database at runtime."""
+
+    db_id: str
+    connection_url: str
+    cache_dir: Optional[str] = None
+    column_meanings: Optional[dict[str, str]] = None
+    example_queries: Optional[list[dict[str, str]]] = None
 
 
 class QueryResponse(BaseModel):
@@ -139,6 +149,12 @@ class NL2SQLEngine:
                 logger.warning("Schema for '%s' changed on disk; rebuilding cached bundle.", db_id)
             else:
                 bundle = cached
+                # DDL-identical cache hit: still honor newly supplied column_meanings
+                # (the hash does not cover descriptions, so they would otherwise be
+                # silently ignored on a hit).
+                if apply_column_meanings(bundle, db_id, column_meanings):
+                    logger.info("Merged updated column_meanings into cached bundle for '%s'.", db_id)
+                    bundle.save(bpath)
         if bundle is None:
             bundle = introspect_database(connection_url, db_id=db_id, column_meanings=column_meanings)
             bundle.save(bpath)
@@ -219,9 +235,17 @@ class NL2SQLEngine:
         # tables (>1k tokens) raw into the parser.
         ret = self.retriever.retrieve(norm_q, bundle, v_idx)
         cand_tables = [t for t in ret.candidate_tables if allowed_set is None or t.name.lower() in allowed_set]
+        # RBAC must gate grounded literals too: un-filtered value_matches would leak
+        # forbidden columns and their cell values (salaries.bonus = '50000') into the
+        # parser prompt and the XGrammar literal grounding despite the table filter.
+        value_matches = (
+            ret.value_matches
+            if allowed_set is None
+            else [v for v in ret.value_matches if v.table_name.lower() in allowed_set]
+        )
         if self.linker is not None:
             linked_tables = self.linker.prune_schema(
-                norm_q, bundle, cand_tables, ret.value_matches, evidence=evidence,
+                norm_q, bundle, cand_tables, value_matches, evidence=evidence,
                 threshold=self.cfg.models.linker_threshold,
                 min_tables=self.cfg.models.linker_min_tables,
                 max_tables=self.cfg.models.linker_max_tables,
@@ -232,7 +256,7 @@ class NL2SQLEngine:
 
         linked_names = [t.name for t in linked_tables]
         schema_txt = format_schema_for_parser(
-            bundle, linked_tables, ret.value_matches, norm_q, evidence,
+            bundle, linked_tables, value_matches, norm_q, evidence,
             example_hints=ret.example_hints,
         )
 
@@ -267,7 +291,7 @@ class NL2SQLEngine:
 
         # Layer 4: Graphix-CodeT5+-220M + XGrammar Candidate Generation
         raw_cands = self.parser.generate_candidates(
-            schema_txt, bundle, linked_tables, ret.value_matches,
+            schema_txt, bundle, linked_tables, value_matches,
             num_candidates=self.cfg.models.num_return_candidates,
             max_source_len=self.cfg.models.parser_max_source_length,
             max_target_len=self.cfg.models.parser_max_target_length,
@@ -359,6 +383,30 @@ def create_app(engine: NL2SQLEngine) -> FastAPI:
             "status": "ok",
             "models_loaded": engine.models_loaded,
             "registered_databases": sorted(engine.db_registry),
+        }
+
+    @app.post("/register")
+    def register_db(req: RegisterRequest) -> dict[str, Any]:
+        """Register (or refresh) a database so /query can serve it without glue code.
+
+        Keeps the on-disk cache convention used by prepare/pipeline runs.
+        """
+        cache_dir = req.cache_dir or str(Path(engine.cfg.data.data_dir) / "schema_caches")
+        try:
+            bundle = engine.register_database(
+                db_id=req.db_id,
+                connection_url=req.connection_url,
+                cache_dir=cache_dir,
+                column_meanings=req.column_meanings,
+                example_queries=req.example_queries,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Database registration failed: {exc}") from exc
+        return {
+            "db_id": bundle.db_id,
+            "tables": len(bundle.tables),
+            "join_edges": len(bundle.join_edges),
+            "registered": sorted(engine.db_registry),
         }
 
     @app.post("/query", response_model=QueryResponse)

@@ -219,6 +219,13 @@ class NL2SQLTrainer:
                     if global_step % tcfg.save_every_steps == 0:
                         # Mid-epoch saves record epoch + 1: resuming continues at the
                         # next epoch boundary instead of replaying this epoch's batches.
+                        # TRADE-OFF (documented): the remaining batches of the interrupted
+                        # epoch are skipped, while global_step (and the LR schedule)
+                        # still count them -- an interrupted large epoch therefore does
+                        # not re-run its unprocessed tail. Exact mid-epoch continuation
+                        # would require deterministic per-epoch shuffling plus a
+                        # skip-batches marker; use epoch-boundary saves instead when
+                        # every batch matters more than fast crash recovery.
                         self.ckpt_mgr.save(
                             stage=stage, model=model, optimizer=optimizer, scheduler=scheduler,
                             scaler=scaler, epoch=epoch + 1, global_step=global_step,
@@ -428,12 +435,15 @@ class NL2SQLTrainer:
                     })
         return samples
 
-    @torch.no_grad()
     def _calibrate_temperature(self, model: ModernBertVerifier, val_samples: list[dict[str, Any]], max_length: int) -> None:
         """Fit the verifier temperature on validation logits (1-pass LBFGS).
 
         Without calibration the abstention threshold operates on raw sigmoid scores,
-        making its 0.45 cut-off arbitrary.
+        making its 0.45 cut-off arbitrary. Only the validation forward pass runs
+        under no_grad: the L-BFGS closure needs live autograd on ``temp`` -- a
+        method-wide @torch.no_grad() would make loss.backward() raise "element 0
+        of tensors does not require grad" on torch versions whose LBFGS does not
+        internally re-enable grad for the closure, silently keeping T=1.0.
         """
         if len(val_samples) < 8 or len({s["label"] for s in val_samples}) < 2:
             return
@@ -442,10 +452,11 @@ class NL2SQLTrainer:
         loader = DataLoader(VerifierDataset(val_samples), batch_size=16, shuffle=False, collate_fn=collate)
         logits_all: list[torch.Tensor] = []
         labels_all: list[torch.Tensor] = []
-        for batch in loader:
-            out = model(batch["input_ids"].to(self.device), batch["attention_mask"].to(self.device))
-            logits_all.append(out["logits"].float().cpu())
-            labels_all.append(batch["labels"].cpu())
+        with torch.no_grad():
+            for batch in loader:
+                out = model(batch["input_ids"].to(self.device), batch["attention_mask"].to(self.device))
+                logits_all.append(out["logits"].float().cpu())
+                labels_all.append(batch["labels"].cpu())
         logits = torch.cat(logits_all)
         labels = torch.cat(labels_all)
 
@@ -486,7 +497,14 @@ class NL2SQLTrainer:
         v_loader = self._loader(VerifierDataset(v_samples), collate, batch_size=self.cfg.training.batch_size, shuffle=False) if v_samples else None
         result = self._run_generic_loop("verifier", model, t_loader, v_loader, step, lambda m, d: m.save_pretrained(d))
 
-        # Post-training calibration on validation logits, persisted into the artifact.
+        # Calibrate + persist the BEST checkpoint, not the final epoch's weights.
+        # _run_generic_loop saves the best-validation epoch to artifacts/verifier;
+        # after early stopping the in-memory `model` sits on the overfit final epoch,
+        # so calibrating and save_pretrained-ing it directly would clobber the best
+        # checkpoint. Reload the best artifact first and calibrate that.
+        verifier_dir = Path(self.cfg.training.output_dir) / "artifacts" / "verifier"
+        if verifier_dir.exists():
+            model = ModernBertVerifier.from_pretrained_dir(verifier_dir, map_location=str(self.device)).to(self.device)
         self._calibrate_temperature(model, v_samples, self.cfg.models.verifier_max_length)
-        model.save_pretrained(Path(self.cfg.training.output_dir) / "artifacts" / "verifier")
+        model.save_pretrained(verifier_dir)
         return result

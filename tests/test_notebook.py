@@ -158,6 +158,7 @@ def test_notebook_orchestrates_public_pipeline_interface(tmp_path: Path, monkeyp
         "train",
         "evaluate:test:False",
         "evaluate:test:True",
+        "evaluate:minidev:False",
         "push_artifacts",
     ]
     # The notebook kept references to the results for its monitoring display

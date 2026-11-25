@@ -73,21 +73,41 @@ def _is_trivial_on(on: Optional[exp.Expression]) -> bool:
     return on is None or (isinstance(on, exp.Boolean) and on.this is True)
 
 
-def _build_query_scope(ast: exp.Expression) -> dict[str, str]:
-    """Map every table (and its alias) referenced in the query to its canonical name.
+def _nearest_select(node: exp.Expression) -> Optional[exp.Select]:
+    """Closest enclosing Select of a node (aggregates resolve in their own scope)."""
+    parent = getattr(node, "parent", None)
+    while parent is not None and not isinstance(parent, exp.Select):
+        parent = getattr(parent, "parent", None)
+    return parent if isinstance(parent, exp.Select) else None
 
-    Join-synthesis must emit ``o.customer_id`` when the query aliased orders as ``o``;
-    emitting the raw table name produces invalid SQL on aliased queries.
+
+def _build_select_scope(select: exp.Select) -> dict[str, str]:
+    """Map the tables (and their aliases) of *this* Select's FROM/JOINs to canonical names.
+
+    Scoped to a single Select so aliases declared inside subqueries or CTEs cannot
+    leak into (or shadow) the outer scope used for fan-out resolution and join
+    synthesis. Join-synthesis must emit ``o.customer_id`` when the query aliased
+    orders as ``o``; emitting the raw table name produces invalid SQL on aliased
+    queries.
     """
     scope: dict[str, str] = {}
-    for tbl in ast.find_all(exp.Table):
+
+    def _add_source_table(tbl: exp.Table) -> None:
         tname = tbl.name
         if not tname:
-            continue
+            return
         alias_or_name = tbl.alias_or_name
         scope.setdefault(tname.lower(), tname)
         if alias_or_name:
             scope.setdefault(alias_or_name.lower(), tname)
+
+    from_expr = select.args.get("from_") or select.args.get("from")
+    from_table = getattr(from_expr, "this", None) if from_expr is not None else None
+    if isinstance(from_table, exp.Table):
+        _add_source_table(from_table)
+    for j in select.args.get("joins") or []:
+        if isinstance(j.this, exp.Table):
+            _add_source_table(j.this)
     return scope
 
 
@@ -125,12 +145,26 @@ def _detect_fanout_tables(ast: exp.Expression, bundle: SchemaBundle) -> list[str
     if len(aggs) < 2:
         return []
 
-    scope = _build_query_scope(ast)
+    # Alias resolution is per-Select: each column resolves against the FROM/JOINs of
+    # the Select that actually encloses it, never against aliases declared in some
+    # sibling subquery.
+    scope_cache: dict[int, dict[str, str]] = {}
+
+    def _scope_of(col: exp.Column) -> dict[str, str]:
+        sel = _nearest_select(col)
+        key = id(sel) if sel is not None else 0
+        if key not in scope_cache:
+            scope_cache[key] = _build_select_scope(sel) if sel is not None else {}
+        return scope_cache[key]
+
     agg_tables: set[str] = set()
     for agg in aggs:
         for col in agg.find_all(exp.Column):
             if col.table:
-                agg_tables.add(scope.get(col.table.lower(), col.table.lower()))
+                # Canonical names must be lowercased: mixed-case table names ("Orders",
+                # common in BIRD) would otherwise miss the lowercase join-edge keys
+                # below and silently skip fan-out detection.
+                agg_tables.add(_scope_of(col).get(col.table.lower(), col.table.lower()).lower())
     if len(agg_tables) < 2:
         return []
 
@@ -198,7 +232,7 @@ def compile_and_validate_sql(
         from_expr = ast.args.get("from_") or ast.args.get("from")
         joins = ast.args.get("joins") or []
         if from_expr and joins:
-            scope = _build_query_scope(ast)
+            scope = _build_select_scope(ast)
             base_name = from_expr.this.name if isinstance(from_expr.this, exp.Table) else None
             base_tbl = scope.get(base_name.lower()) if base_name else None
             # table name (lower) -> reference spelling (alias or name) to use in ON clauses
