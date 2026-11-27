@@ -1,0 +1,28 @@
+# Python build / packaging
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Test / coverage caches
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Local training artifacts (datasets, checkpoints, run outputs)
+workspace/
+runs/
+*.ckpt
+*.pt
+
+# Environments
+.venv/
+venv/
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
